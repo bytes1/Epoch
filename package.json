@@ -1,0 +1,19 @@
+{
+  "name": "bch-prediction-market",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.27.0",
+  "scripts": {
+    "build": "pnpm --recursive build",
+    "test": "pnpm --recursive --if-present test",
+    "contracts:compile": "pnpm --filter @bch-market/contracts compile",
+    "chipnet:address": "pnpm --filter @bch-market/backend chipnet:address",
+    "chipnet:wallet:create": "pnpm --filter @bch-market/backend chipnet:wallet:create"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "vitest": "^3.1.1"
+  }
+}

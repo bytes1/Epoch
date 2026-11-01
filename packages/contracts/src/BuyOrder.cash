@@ -1,0 +1,20 @@
+pragma cashscript ^0.13.0;
+
+contract BuyOrder(pubkey makerPubKey, bytes20 makerLockingBytecodeHash, bytes32 targetTokenCategory, int pricePerShareSats) {
+    function fill(int sharesFilled) {
+        require(sharesFilled > 0);
+        require(pricePerShareSats > 0 && pricePerShareSats < 1000);
+        int costSats = sharesFilled * pricePerShareSats;
+        require(tx.outputs[this.activeInputIndex].tokenCategory == targetTokenCategory);
+        require(tx.outputs[this.activeInputIndex].tokenAmount == sharesFilled);
+        require(hash160(tx.outputs[this.activeInputIndex].lockingBytecode) == makerLockingBytecodeHash);
+        if (tx.inputs[this.activeInputIndex].value > costSats + 1000) {
+            require(tx.outputs[this.activeInputIndex + 2].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);
+            require(tx.outputs[this.activeInputIndex + 2].value == tx.inputs[this.activeInputIndex].value - costSats);
+        }
+    }
+
+    function cancel(sig makerSig) {
+        require(checkSig(makerSig, makerPubKey));
+    }
+}

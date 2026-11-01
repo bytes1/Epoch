@@ -1,0 +1,51 @@
+{
+  "contractName": "BuyOrder",
+  "constructorInputs": [
+    { "name": "makerPubKey", "type": "pubkey" },
+    { "name": "makerLockingBytecodeHash", "type": "bytes20" },
+    { "name": "targetTokenCategory", "type": "bytes32" },
+    { "name": "pricePerShareSats", "type": "int" }
+  ],
+  "abi": [
+    {
+      "name": "fill",
+      "inputs": [
+        { "name": "sharesFilled", "type": "int" }
+      ]
+    },
+    {
+      "name": "cancel",
+      "inputs": [
+        { "name": "makerSig", "type": "sig" }
+      ]
+    }
+  ],
+  "bytecode": "OP_4 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_5 OP_PICK OP_0 OP_GREATERTHAN OP_VERIFY OP_3 OP_PICK OP_0 OP_GREATERTHAN OP_4 OP_PICK e803 OP_LESSTHAN OP_BOOLAND OP_VERIFY OP_5 OP_PICK OP_4 OP_ROLL OP_MUL OP_INPUTINDEX OP_OUTPUTTOKENCATEGORY OP_4 OP_ROLL OP_EQUALVERIFY OP_INPUTINDEX OP_OUTPUTTOKENAMOUNT OP_5 OP_ROLL OP_NUMEQUALVERIFY OP_INPUTINDEX OP_OUTPUTBYTECODE OP_HASH160 OP_3 OP_ROLL OP_EQUALVERIFY OP_INPUTINDEX OP_UTXOVALUE OP_OVER e803 OP_ADD OP_GREATERTHAN OP_IF OP_INPUTINDEX OP_2 OP_ADD OP_OUTPUTBYTECODE OP_INPUTINDEX OP_UTXOBYTECODE OP_EQUALVERIFY OP_INPUTINDEX OP_2 OP_ADD OP_OUTPUTVALUE OP_INPUTINDEX OP_UTXOVALUE OP_2 OP_PICK OP_SUB OP_NUMEQUALVERIFY OP_ENDIF OP_2DROP OP_DROP OP_1 OP_ELSE OP_4 OP_ROLL OP_1 OP_NUMEQUALVERIFY OP_4 OP_ROLL OP_SWAP OP_CHECKSIG OP_NIP OP_NIP OP_NIP OP_ENDIF",
+  "source": "pragma cashscript ^0.13.0;\n\ncontract BuyOrder(pubkey makerPubKey, bytes20 makerLockingBytecodeHash, bytes32 targetTokenCategory, int pricePerShareSats) {\n    function fill(int sharesFilled) {\n        require(sharesFilled > 0);\n        require(pricePerShareSats > 0 && pricePerShareSats < 1000);\n        int costSats = sharesFilled * pricePerShareSats;\n        require(tx.outputs[this.activeInputIndex].tokenCategory == targetTokenCategory);\n        require(tx.outputs[this.activeInputIndex].tokenAmount == sharesFilled);\n        require(hash160(tx.outputs[this.activeInputIndex].lockingBytecode) == makerLockingBytecodeHash);\n        if (tx.inputs[this.activeInputIndex].value > costSats + 1000) {\n            require(tx.outputs[this.activeInputIndex + 2].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);\n            require(tx.outputs[this.activeInputIndex + 2].value == tx.inputs[this.activeInputIndex].value - costSats);\n        }\n    }\n\n    function cancel(sig makerSig) {\n        require(checkSig(makerSig, makerPubKey));\n    }\n}\n",
+  "fingerprint": "60d09297dd767d0252c2fd72676311a8cb595f406fcae231dde84ea6edaead07",
+  "debug": {
+    "bytecode": "5479009c63557900a069537900a0547902e8039f9a695579547a95c0d1547a88c0d3557a9dc0cda9537a88c0c67802e80393a063c05293cdc0c788c05293ccc0c65279949d686d755167547a519d547a7cac77777768",
+    "sourceMap": "4:4:15:5;;;;;5:16:5:28;;:31::32;:16:::1;:8::34;6:16:6:33:0;;:36::37;:16:::1;:41::58:0;;:61::65;:41:::1;:16;:8::67;7:23:7:35:0;;:38::55;;:23:::1;8:27:8:48:0;:16::63:1;:67::86:0;;:8::88:1;9:27:9:48:0;:16::61:1;:65::77:0;;:8::79:1;10:35:10:56:0;:24::73:1;:16::74;:78::102:0;;:8::104:1;11:22:11:43:0;:12::50:1;:53::61:0;:64::68;:53:::1;:12;:70:14:9:0;12:31:12:52;:55::56;:31:::1;:20::73;:87::108:0;:77::125:1;:12::127;13:31:13:52:0;:55::56;:31:::1;:20::63;:77::98:0;:67::105:1;:108::116:0;;:67:::1;:12::118;11:70:14:9;4:36:15:5;;;:4;17::19::0;;;;18:25:18:33;;:35::46;:8::49:1;17:34:19:5;;;3:0:20:1",
+    "logs": [],
+    "requires": [
+      { "ip": 13, "line": 5 },
+      { "ip": 23, "line": 6 },
+      { "ip": 33, "line": 8 },
+      { "ip": 38, "line": 9 },
+      { "ip": 44, "line": 10 },
+      { "ip": 58, "line": 12 },
+      { "ip": 68, "line": 13 },
+      { "ip": 82, "line": 18 }
+    ],
+    "sourceTags": "78:80:sc"
+  },
+  "compiler": {
+    "name": "cashc",
+    "version": "0.13.3",
+    "options": {
+      "enforceFunctionParameterTypes": true,
+      "enforceLocktimeGuard": true
+    }
+  },
+  "updatedAt": "2026-11-01T08:27:16.880Z"
+}

@@ -1,0 +1,53 @@
+{
+  "contractName": "SellOrder",
+  "constructorInputs": [
+    { "name": "makerPubKey", "type": "pubkey" },
+    { "name": "makerLockingBytecodeHash", "type": "bytes20" },
+    { "name": "tokenCategory", "type": "bytes32" },
+    { "name": "pricePerShareSats", "type": "int" }
+  ],
+  "abi": [
+    {
+      "name": "fill",
+      "inputs": [
+        { "name": "sharesFilled", "type": "int" }
+      ]
+    },
+    {
+      "name": "cancel",
+      "inputs": [
+        { "name": "makerSig", "type": "sig" }
+      ]
+    }
+  ],
+  "bytecode": "OP_4 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_5 OP_PICK OP_0 OP_GREATERTHAN OP_VERIFY OP_3 OP_PICK OP_0 OP_GREATERTHAN OP_4 OP_PICK e803 OP_LESSTHAN OP_BOOLAND OP_VERIFY OP_INPUTINDEX OP_UTXOTOKENCATEGORY OP_3 OP_PICK OP_EQUALVERIFY OP_5 OP_PICK OP_INPUTINDEX OP_UTXOTOKENAMOUNT OP_LESSTHANOREQUAL OP_VERIFY OP_5 OP_PICK OP_4 OP_ROLL OP_MUL OP_INPUTINDEX OP_OUTPUTVALUE OP_NUMEQUALVERIFY OP_INPUTINDEX OP_OUTPUTBYTECODE OP_HASH160 OP_ROT OP_EQUALVERIFY OP_3 OP_PICK OP_INPUTINDEX OP_UTXOTOKENAMOUNT OP_LESSTHAN OP_IF OP_INPUTINDEX OP_2 OP_ADD OP_OUTPUTTOKENCATEGORY OP_2 OP_PICK OP_EQUALVERIFY OP_INPUTINDEX OP_2 OP_ADD OP_OUTPUTTOKENAMOUNT OP_INPUTINDEX OP_UTXOTOKENAMOUNT OP_5 OP_PICK OP_SUB OP_NUMEQUALVERIFY OP_INPUTINDEX OP_2 OP_ADD OP_OUTPUTBYTECODE OP_INPUTINDEX OP_UTXOBYTECODE OP_EQUALVERIFY OP_ENDIF OP_2DROP OP_2DROP OP_1 OP_ELSE OP_4 OP_ROLL OP_1 OP_NUMEQUALVERIFY OP_4 OP_ROLL OP_SWAP OP_CHECKSIG OP_NIP OP_NIP OP_NIP OP_ENDIF",
+  "source": "pragma cashscript ^0.13.0;\n\ncontract SellOrder(pubkey makerPubKey, bytes20 makerLockingBytecodeHash, bytes32 tokenCategory, int pricePerShareSats) {\n    function fill(int sharesFilled) {\n        require(sharesFilled > 0);\n        require(pricePerShareSats > 0 && pricePerShareSats < 1000);\n        require(tx.inputs[this.activeInputIndex].tokenCategory == tokenCategory);\n        require(sharesFilled <= tx.inputs[this.activeInputIndex].tokenAmount);\n        int payoutSats = sharesFilled * pricePerShareSats;\n        require(tx.outputs[this.activeInputIndex].value == payoutSats);\n        require(hash160(tx.outputs[this.activeInputIndex].lockingBytecode) == makerLockingBytecodeHash);\n        if (sharesFilled < tx.inputs[this.activeInputIndex].tokenAmount) {\n            require(tx.outputs[this.activeInputIndex + 2].tokenCategory == tokenCategory);\n            require(tx.outputs[this.activeInputIndex + 2].tokenAmount == tx.inputs[this.activeInputIndex].tokenAmount - sharesFilled);\n            require(tx.outputs[this.activeInputIndex + 2].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);\n        }\n    }\n\n    function cancel(sig makerSig) {\n        require(checkSig(makerSig, makerPubKey));\n    }\n}\n",
+  "fingerprint": "67711497510a606260f818f9323da7d6f1856236bd41aee24c7006953eeb9e0c",
+  "debug": {
+    "bytecode": "5479009c63557900a069537900a0547902e8039f9a69c0ce5379885579c0d0a1695579547a95c0cc9dc0cda97b885379c0d09f63c05293d1527988c05293d3c0d05579949dc05293cdc0c788686d6d5167547a519d547a7cac77777768",
+    "sourceMap": "4:4:17:5;;;;;5:16:5:28;;:31::32;:16:::1;:8::34;6:16:6:33:0;;:36::37;:16:::1;:41::58:0;;:61::65;:41:::1;:16;:8::67;7:26:7:47:0;:16::62:1;:66::79:0;;:8::81:1;8:16:8:28:0;;:42::63;:32::76:1;:16;:8::78;9:25:9:37:0;;:40::57;;:25:::1;10:27:10:48:0;:16::55:1;:8::71;11:35:11:56:0;:24::73:1;:16::74;:78::102:0;:8::104:1;12:12:12:24:0;;:37::58;:27::71:1;:12;:73:16:9:0;13:31:13:52;:55::56;:31:::1;:20::71;:75::88:0;;:12::90:1;14:31:14:52:0;:55::56;:31:::1;:20::69;:83::104:0;:73::117:1;:120::132:0;;:73:::1;:12::134;15:31:15:52:0;:55::56;:31:::1;:20::73;:87::108:0;:77::125:1;:12::127;12:73:16:9;4:36:17:5;;;:4;19::21::0;;;;20:25:20:33;;:35::46;:8::49:1;19:34:21:5;;;3:0:22:1",
+    "logs": [],
+    "requires": [
+      { "ip": 13, "line": 5 },
+      { "ip": 23, "line": 6 },
+      { "ip": 28, "line": 7 },
+      { "ip": 34, "line": 8 },
+      { "ip": 42, "line": 10 },
+      { "ip": 47, "line": 11 },
+      { "ip": 60, "line": 13 },
+      { "ip": 70, "line": 14 },
+      { "ip": 77, "line": 15 },
+      { "ip": 91, "line": 20 }
+    ],
+    "sourceTags": "87:89:sc"
+  },
+  "compiler": {
+    "name": "cashc",
+    "version": "0.13.3",
+    "options": {
+      "enforceFunctionParameterTypes": true,
+      "enforceLocktimeGuard": true
+    }
+  },
+  "updatedAt": "2026-11-01T08:27:20.175Z"
+}

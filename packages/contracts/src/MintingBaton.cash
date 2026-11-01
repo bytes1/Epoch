@@ -1,0 +1,12 @@
+pragma cashscript ^0.13.0;
+
+contract MintingBaton(bytes20 vaultScriptHash) {
+    function preserve() {
+        require(hash160(tx.inputs[0].lockingBytecode) == vaultScriptHash);
+        require(tx.outputs[this.activeInputIndex].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);
+        bytes category, bytes capability = tx.inputs[this.activeInputIndex].tokenCategory.split(32);
+        require(capability == 0x02);
+        require(tx.outputs[this.activeInputIndex].tokenCategory == category + 0x02);
+        require(tx.outputs[this.activeInputIndex].nftCommitment == tx.inputs[this.activeInputIndex].nftCommitment);
+    }
+}

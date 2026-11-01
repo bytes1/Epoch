@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+.env
+.env.*
+!.env.example
+packages/backend/data/*.db
+packages/backend/data/*.db-shm
+packages/backend/data/*.db-wal
+coverage/
