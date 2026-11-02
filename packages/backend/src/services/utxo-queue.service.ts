@@ -17,3 +17,5 @@ export class KeyedMutex {
 }
 
 export const marketMutex = new KeyedMutex();
+/** Serializes spends from the shared operational wallet across all markets. */
+export const walletMutex = new KeyedMutex();

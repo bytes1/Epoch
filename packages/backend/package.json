@@ -6,7 +6,10 @@
     "dev": "tsx watch src/index.ts",
     "chipnet:address": "tsx scripts/chipnet-address.ts",
     "chipnet:pubkey": "tsx scripts/chipnet-pubkey.ts",
+    "chipnet:balance": "tsx scripts/chipnet-balance.ts",
     "chipnet:wallet:create": "tsx scripts/create-chipnet-wallet.ts",
+    "fund-orders": "tsx scripts/fund-orders.ts",
+    "fund-sell-order": "tsx scripts/fund-sell-order.ts",
     "build": "tsc --noEmit",
     "test": "vitest run --testTimeout=30000"
   },

@@ -1,9 +1,10 @@
 import '../src/config/load-env.js';
-import { chipnetFundingAddress } from '../src/services/chipnet.service.js';
+import { chipnetFundingAddress, decodeChipnetWallet } from '../src/services/chipnet.service.js';
 
 try {
-  console.log(chipnetFundingAddress());
-  console.log('Network: Chipnet (bchtest). Fund this address with at least 6,000 sats of native BCH before creating a market.');
+  const wallet = process.argv.includes('--wallet2') ? 2 : 1;
+  console.log(chipnetFundingAddress(decodeChipnetWallet(wallet)));
+  console.log(`Wallet ${wallet} · Chipnet (bchtest).`);
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   process.exitCode = 1;

@@ -1,12 +1,13 @@
 pragma cashscript ^0.13.0;
 
 contract SellOrder(pubkey makerPubKey, bytes20 makerLockingBytecodeHash, bytes32 tokenCategory, int pricePerShareSats) {
-    function fill(int sharesFilled) {
+    function fill(int sharesFilled, int executionPriceSats) {
         require(sharesFilled > 0);
         require(pricePerShareSats > 0 && pricePerShareSats < 1000);
+        require(executionPriceSats >= pricePerShareSats && executionPriceSats < 1000);
         require(tx.inputs[this.activeInputIndex].tokenCategory == tokenCategory);
         require(sharesFilled <= tx.inputs[this.activeInputIndex].tokenAmount);
-        int payoutSats = sharesFilled * pricePerShareSats;
+        int payoutSats = sharesFilled * executionPriceSats;
         require(tx.outputs[this.activeInputIndex].value == payoutSats);
         require(hash160(tx.outputs[this.activeInputIndex].lockingBytecode) == makerLockingBytecodeHash);
         if (sharesFilled < tx.inputs[this.activeInputIndex].tokenAmount) {

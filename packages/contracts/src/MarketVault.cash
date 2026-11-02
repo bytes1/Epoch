@@ -6,19 +6,30 @@ contract MarketVault(bytes32 yesCategory, bytes32 noCategory, pubkey oraclePubKe
         require(this.activeInputIndex == 0);
         require(tx.inputs.length >= 3);
         require(tx.inputs[0].nftCommitment == 0x00);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
         require(tx.inputs[1].tokenCategory == yesCategory + 0x02);
+        require(tx.inputs[1].tokenAmount >= shares);
         require(tx.inputs[2].tokenCategory == noCategory + 0x02);
+        require(tx.inputs[2].tokenAmount >= shares);
         require(tx.outputs[0].value == tx.inputs[0].value + shares * 1000);
         require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
         require(tx.outputs[0].nftCommitment == 0x00);
         require(tx.outputs[1].tokenCategory == yesCategory + 0x02);
+        require(tx.outputs[1].tokenAmount == tx.inputs[1].tokenAmount - shares);
         require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
         require(tx.outputs[2].tokenCategory == noCategory + 0x02);
+        require(tx.outputs[2].tokenAmount == tx.inputs[2].tokenAmount - shares);
         require(tx.outputs[2].lockingBytecode == tx.inputs[2].lockingBytecode);
         require(tx.outputs[3].tokenCategory == yesCategory);
         require(tx.outputs[3].tokenAmount == shares);
         require(tx.outputs[4].tokenCategory == noCategory);
         require(tx.outputs[4].tokenAmount == shares);
+        require(tx.outputs.length <= 10);
+        if (tx.outputs.length > 5) require(tx.outputs[5].tokenCategory == 0x);
+        if (tx.outputs.length > 6) require(tx.outputs[6].tokenCategory == 0x);
+        if (tx.outputs.length > 7) require(tx.outputs[7].tokenCategory == 0x);
+        if (tx.outputs.length > 8) require(tx.outputs[8].tokenCategory == 0x);
+        if (tx.outputs.length > 9) require(tx.outputs[9].tokenCategory == 0x);
     }
 
     function mergeCompleteSet(int shares) {
@@ -26,13 +37,27 @@ contract MarketVault(bytes32 yesCategory, bytes32 noCategory, pubkey oraclePubKe
         require(this.activeInputIndex == 0);
         require(tx.inputs[0].nftCommitment == 0x00);
         require(tx.inputs[1].tokenCategory == yesCategory);
-        require(tx.inputs[1].tokenAmount == shares);
+        require(tx.inputs[1].tokenAmount >= shares);
         require(tx.inputs[2].tokenCategory == noCategory);
-        require(tx.inputs[2].tokenAmount == shares);
+        require(tx.inputs[2].tokenAmount >= shares);
+        require(tx.outputs.length >= 5 && tx.outputs.length <= 6);
         require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
-        require(tx.outputs[0].value == tx.inputs[0].value - shares * 1000);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[1].value + tx.outputs[2].value == shares * 1000);
+        require(tx.outputs[0].value == tx.inputs[0].value - tx.outputs[1].value - tx.outputs[2].value);
         require(tx.outputs[0].value >= 1000);
         require(tx.outputs[0].nftCommitment == 0x00);
+        require((tx.inputs[1].tokenAmount == shares && tx.outputs[3].tokenCategory == 0x && tx.outputs[3].tokenAmount == 0) ||
+            (tx.inputs[1].tokenAmount > shares && tx.outputs[3].tokenCategory == yesCategory &&
+                tx.outputs[3].tokenAmount == tx.inputs[1].tokenAmount - shares &&
+                tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode));
+        require((tx.inputs[2].tokenAmount == shares && tx.outputs[4].tokenCategory == 0x && tx.outputs[4].tokenAmount == 0) ||
+            (tx.inputs[2].tokenAmount > shares && tx.outputs[4].tokenCategory == noCategory &&
+                tx.outputs[4].tokenAmount == tx.inputs[2].tokenAmount - shares &&
+                tx.outputs[4].lockingBytecode == tx.inputs[2].lockingBytecode));
+        if (tx.outputs.length > 5) require(tx.outputs[5].tokenCategory == 0x);
     }
 
     function resolveMarket(datasig oracleSig, bytes1 outcome) {
@@ -41,8 +66,9 @@ contract MarketVault(bytes32 yesCategory, bytes32 noCategory, pubkey oraclePubKe
         require(outcome == 0x01 || outcome == 0x02);
         require(checkDataSig(oracleSig, marketId + outcome, oraclePubKey));
         require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
         require(tx.outputs[0].nftCommitment == outcome);
-        require(tx.outputs[0].value <= tx.inputs[0].value);
+        require(tx.outputs[0].value == tx.inputs[0].value);
     }
 
     function redeemWinnings(int shares) {
@@ -53,11 +79,14 @@ contract MarketVault(bytes32 yesCategory, bytes32 noCategory, pubkey oraclePubKe
         require((tx.inputs[0].nftCommitment == 0x01 && tx.inputs[1].tokenCategory == yesCategory) ||
             (tx.inputs[0].nftCommitment == 0x02 && tx.inputs[1].tokenCategory == noCategory));
         require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
         require(tx.outputs[0].value == tx.inputs[0].value - shares * 1000);
         require(tx.outputs[0].nftCommitment == tx.inputs[0].nftCommitment);
         require(tx.outputs[0].value >= 1000);
         require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
-        require(tx.outputs[1].value == shares * 1000 - 1000);
+        require(tx.outputs[1].value == shares * 1000);
         require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs.length <= 3);
+        if (tx.outputs.length > 2) require(tx.outputs[2].tokenCategory == 0x);
     }
 }

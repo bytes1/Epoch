@@ -7,3 +7,4 @@ packages/backend/data/*.db
 packages/backend/data/*.db-shm
 packages/backend/data/*.db-wal
 coverage/
+codebase.txt

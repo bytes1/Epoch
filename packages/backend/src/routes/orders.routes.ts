@@ -7,16 +7,18 @@ import { z } from 'zod';
 import type { MarketDb } from '../db/index.js';
 import { markets, orders } from '../db/schema.js';
 import { MatcherService } from '../services/matcher.service.js';
+import { categoryIdVmBytes } from '../utils/cashtokens.js';
 
 export interface OrderVerifier {
   verify(input: { market: typeof markets.$inferSelect; side: 'BUY' | 'SELL'; outcome: 'YES' | 'NO'; makerPubKey: string; utxoTxid: string;
     utxoVout: number; utxoSatoshis: number; tokenCategory?: string; tokenAmount?: number; priceSats: number; shares: number }): Promise<void>;
 }
 
+const MAX_SAFE_SHARES = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 const prepareSchema = z.object({ marketId: z.string(), side: z.enum(['BUY', 'SELL']), outcome: z.enum(['YES', 'NO']),
-  priceSats: z.number().int().min(1).max(999), shares: z.number().int().positive(), makerPubKey: z.string().regex(/^(02|03)[0-9a-f]{64}$/i) });
+  priceSats: z.number().int().min(1).max(999), shares: z.number().int().positive().max(MAX_SAFE_SHARES), makerPubKey: z.string().regex(/^(02|03)[0-9a-f]{64}$/i) });
 const registerSchema = prepareSchema.extend({ makerAddress: z.string().min(2), utxoTxid: z.string().regex(/^[0-9a-f]{64}$/i),
-  utxoVout: z.number().int().nonnegative(), utxoSatoshis: z.number().int().positive(), tokenCategory: z.string().optional(), tokenAmount: z.number().int().nonnegative().optional() });
+  utxoVout: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), utxoSatoshis: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), tokenCategory: z.string().optional(), tokenAmount: z.number().int().nonnegative().max(MAX_SAFE_SHARES).optional() });
 
 export async function registerOrderRoutes(app: FastifyInstance, db: MarketDb, matcher: MatcherService, verifier?: OrderVerifier) {
   app.post('/api/orders/prepare', async (request, reply) => {
@@ -33,7 +35,7 @@ export async function registerOrderRoutes(app: FastifyInstance, db: MarketDb, ma
     const contractName = input.side === 'BUY' ? 'BuyOrder' : 'SellOrder';
     const artifact = JSON.parse(readFileSync(new URL('../../../contracts/artifacts/' + contractName + '.json', import.meta.url), 'utf8'));
     const contract = new Contract(artifact, [input.makerPubKey, makerLockingBytecodeHash,
-      input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId, BigInt(input.priceSats)], { provider: new MockNetworkProvider() });
+      categoryIdVmBytes(input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId), BigInt(input.priceSats)], { provider: new MockNetworkProvider() });
     return { contract: contractName, address: input.side === 'SELL' ? contract.tokenAddress : contract.address,
       requiredSatoshis, requiredTokenCategory: input.side === 'SELL' ? (input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId) : null,
       requiredTokenAmount: input.side === 'SELL' ? input.shares : 0,
@@ -52,7 +54,8 @@ export async function registerOrderRoutes(app: FastifyInstance, db: MarketDb, ma
     if (alreadyRegistered) return reply.code(409).send({ error: 'This UTXO is already registered as an order.' });
     const expectedCategory = input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId;
     const expectedSats = input.side === 'BUY' ? input.shares * input.priceSats + 1000 : 1000;
-    if (input.side === 'BUY' && input.utxoSatoshis < expectedSats) return reply.code(400).send({ error: 'Order UTXO has insufficient BCH' });
+    if (input.side === 'BUY' && input.utxoSatoshis !== expectedSats) return reply.code(400).send({ error: 'Buy order UTXO must contain exactly bid × shares plus 1,000 sats.' });
+    if (input.side === 'SELL' && input.utxoSatoshis !== 1000) return reply.code(400).send({ error: 'Sell order UTXO must contain exactly 1,000 sats.' });
     if (input.side === 'SELL' && (input.tokenCategory !== expectedCategory || input.tokenAmount !== input.shares))
       return reply.code(400).send({ error: 'Order UTXO does not contain the required outcome tokens' });
     if (verifier) {

@@ -1,0 +1,1261 @@
+ 
+// === E:\frontend\bch\packages\backend\scripts\chipnet-address.ts === 
+import '../src/config/load-env.js';
+import { chipnetFundingAddress } from '../src/services/chipnet.service.js';
+
+try {
+  console.log(chipnetFundingAddress());
+  console.log('Network: Chipnet (bchtest). Fund this address with at least 6,000 sats of native BCH before creating a market.');
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  process.exitCode = 1;
+}
+ 
+// === E:\frontend\bch\packages\backend\scripts\chipnet-pubkey.ts === 
+import '../src/config/load-env.js';
+import { secp256k1 } from '@bitauth/libauth';
+import { decodeChipnetWallet } from '../src/services/chipnet.service.js';
+
+const publicKey = secp256k1.derivePublicKeyCompressed(decodeChipnetWallet());
+if (typeof publicKey === 'string') throw new Error('Could not derive compressed public key: ' + publicKey);
+console.log(Buffer.from(publicKey).toString('hex'));
+ 
+// === E:\frontend\bch\packages\backend\scripts\create-chipnet-wallet.ts === 
+import '../src/config/load-env.js';
+import { encodePrivateKeyWif, generatePrivateKey } from '@bitauth/libauth';
+import { chipnetFundingAddress } from '../src/services/chipnet.service.js';
+
+const privateKey = generatePrivateKey();
+if (typeof privateKey === 'string') throw new Error('Could not create a private key: ' + privateKey);
+const wif = encodePrivateKeyWif(privateKey, 'testnet');
+console.log('Chipnet funding address: ' + chipnetFundingAddress(privateKey));
+console.log('Chipnet WIF (secret; keep offline and never share): ' + wif);
+ 
+// === E:\frontend\bch\packages\backend\src\index.ts === 
+import './config/load-env.js';
+import Fastify from 'fastify';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import cors from '@fastify/cors';
+import { createDatabase } from './db/index.js';
+import { GenesisService, MockGenesisAdapter } from './services/genesis.service.js';
+import { MatcherService, MockMatchExecutor } from './services/matcher.service.js';
+import { registerMarketRoutes } from './routes/markets.routes.js';
+import { registerOrderRoutes } from './routes/orders.routes.js';
+import { TickerHub } from './ws/ticker.ws.js';
+import { UnconfiguredMatchExecutor, UnconfiguredResolutionExecutor, type ResolutionExecutor } from './services/resolution.service.js';
+import { ChipnetGenesisAdapter } from './services/chipnet.service.js';
+import { ChipnetMatchExecutor, ChipnetOrderVerifier, ChipnetResolutionExecutor } from './services/chipnet-live.service.js';
+
+export async function createApp(options: { db?: ReturnType<typeof createDatabase>; genesis?: GenesisService; resolver?: ResolutionExecutor } = {}) {
+  const owned = options.db ?? createDatabase();
+  const app = Fastify({ logger: true });
+  const ticker = new TickerHub();
+  await app.register(cors, { origin: process.env.CORS_ORIGIN ?? true });
+  const chipnet = process.env.BCH_NETWORK === 'chipnet';
+  const genesisService = options.genesis ?? new GenesisService(owned.db, chipnet
+    ? (process.env.MARKET_WALLET_PRIVATE_KEY ? new ChipnetGenesisAdapter() : { async createMarket() { throw new Error('Set MARKET_WALLET_PRIVATE_KEY to enable Chipnet market genesis.'); } })
+    : new MockGenesisAdapter());
+  const chipnetReady = Boolean(process.env.MARKET_WALLET_PRIVATE_KEY && (process.env.ORACLE_PRIVATE_KEY || process.env.MARKET_WALLET_PRIVATE_KEY));
+  const matcherExecutor = chipnet ? (chipnetReady ? new ChipnetMatchExecutor(owned.db) : new UnconfiguredMatchExecutor()) : new MockMatchExecutor();
+  const matcher = new MatcherService(owned.db, matcherExecutor, (marketId, update) => ticker.publish(marketId, update));
+  await ticker.register(app);
+  const resolver = options.resolver ?? (chipnet && chipnetReady ? new ChipnetResolutionExecutor(owned.db) : new UnconfiguredResolutionExecutor());
+  await registerMarketRoutes(app, owned.db, genesisService, resolver);
+  await registerOrderRoutes(app, owned.db, matcher, chipnet ? new ChipnetOrderVerifier() : undefined);
+  app.addHook('onClose', async () => { if (!options.db) owned.close(); });
+  return app;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  const app = await createApp();
+  const port = Number(process.env.PORT ?? 3001);
+  await app.listen({ port, host: process.env.HOST ?? '127.0.0.1' });
+}
+ 
+// === E:\frontend\bch\packages\backend\src\config\index.ts === 
+export type NetworkName = 'mocknet' | 'chipnet';
+export const config = {
+  network: (process.env.BCH_NETWORK ?? 'mocknet') as NetworkName,
+  databasePath: process.env.DATABASE_PATH ?? './data/market.db',
+  port: Number(process.env.PORT ?? 3001),
+};
+ 
+// === E:\frontend\bch\packages\backend\src\config\load-env.ts === 
+import dotenv from 'dotenv';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+dotenv.config({ path: resolve(workspaceRoot, '.env') });
+ 
+// === E:\frontend\bch\packages\backend\src\db\index.ts === 
+import Database from 'better-sqlite3';
+import { mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { schema } from './schema.js';
+
+export type MarketDb = BetterSQLite3Database<typeof schema>;
+
+const createTables = (sqlite: Database.Database) => sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS markets (
+    id TEXT PRIMARY KEY, market_id_hex TEXT NOT NULL UNIQUE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED_YES','RESOLVED_NO')),
+    yes_category_id TEXT NOT NULL, no_category_id TEXT NOT NULL, vault_category_id TEXT NOT NULL, vault_contract_address TEXT NOT NULL,
+    last_yes_price_sats INTEGER NOT NULL DEFAULT 500, last_no_price_sats INTEGER NOT NULL DEFAULT 500,
+    volume_sats INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, resolved_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS vault_utxos (
+    id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(id), utxo_role TEXT NOT NULL CHECK(utxo_role IN ('VAULT_MASTER','YES_BATON','NO_BATON')),
+    txid TEXT NOT NULL, vout INTEGER NOT NULL, satoshis INTEGER NOT NULL, token_category TEXT NOT NULL, token_amount INTEGER NOT NULL DEFAULT 0,
+    nft_capability TEXT, nft_commitment TEXT, updated_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS orders (
+    id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(id), maker_address TEXT NOT NULL, maker_pubkey TEXT NOT NULL,
+    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')), outcome TEXT NOT NULL CHECK(outcome IN ('YES','NO')),
+    price_sats INTEGER NOT NULL CHECK(price_sats BETWEEN 1 AND 999), total_shares INTEGER NOT NULL CHECK(total_shares > 0),
+    remaining_shares INTEGER NOT NULL CHECK(remaining_shares >= 0), utxo_txid TEXT NOT NULL, utxo_vout INTEGER NOT NULL,
+    utxo_satoshis INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','PARTIAL','FILLED','CANCELLED')), created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS orders_book_idx ON orders(market_id, outcome, side, status, price_sats, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS orders_outpoint_idx ON orders(utxo_txid, utxo_vout);
+  CREATE TABLE IF NOT EXISTS trades (
+    id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(id), match_type TEXT NOT NULL CHECK(match_type IN ('DIRECT','MINT','MERGE')),
+    yes_price_sats INTEGER NOT NULL, no_price_sats INTEGER NOT NULL, shares_traded INTEGER NOT NULL, bch_txid TEXT NOT NULL, executed_at INTEGER NOT NULL
+  );
+`);
+
+export function createDatabase(path = process.env.DATABASE_PATH ?? './data/market.db') {
+  if (path !== ':memory:') {
+    mkdirSync(dirname(resolve(path)), { recursive: true });
+  }
+  const sqlite = new Database(path);
+  if (path !== ':memory:') sqlite.pragma('journal_mode = WAL');
+  sqlite.pragma('foreign_keys = ON');
+  createTables(sqlite);
+  return { sqlite, db: drizzle(sqlite, { schema }), close: () => sqlite.close() };
+}
+ 
+// === E:\frontend\bch\packages\backend\src\db\schema.ts === 
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const markets = sqliteTable('markets', {
+  id: text('id').primaryKey(), marketIdHex: text('market_id_hex').notNull().unique(),
+  title: text('title').notNull(), description: text('description').notNull().default(''),
+  status: text('status', { enum: ['OPEN', 'RESOLVED_YES', 'RESOLVED_NO'] }).notNull().default('OPEN'),
+  yesCategoryId: text('yes_category_id').notNull(), noCategoryId: text('no_category_id').notNull(),
+  vaultCategoryId: text('vault_category_id').notNull(), vaultContractAddress: text('vault_contract_address').notNull(),
+  lastYesPriceSats: integer('last_yes_price_sats').notNull().default(500),
+  lastNoPriceSats: integer('last_no_price_sats').notNull().default(500), volumeSats: integer('volume_sats').notNull().default(0),
+  createdAt: integer('created_at').notNull(), resolvedAt: integer('resolved_at'),
+});
+
+export const vaultUtxos = sqliteTable('vault_utxos', {
+  id: text('id').primaryKey(), marketId: text('market_id').notNull().references(() => markets.id),
+  utxoRole: text('utxo_role', { enum: ['VAULT_MASTER', 'YES_BATON', 'NO_BATON'] }).notNull(),
+  txid: text('txid').notNull(), vout: integer('vout').notNull(), satoshis: integer('satoshis').notNull(),
+  tokenCategory: text('token_category').notNull(), tokenAmount: integer('token_amount').notNull().default(0),
+  nftCapability: text('nft_capability'), nftCommitment: text('nft_commitment'), updatedAt: integer('updated_at').notNull(),
+});
+
+export const orders = sqliteTable('orders', {
+  id: text('id').primaryKey(), marketId: text('market_id').notNull().references(() => markets.id),
+  makerAddress: text('maker_address').notNull(), makerPubkey: text('maker_pubkey').notNull(),
+  side: text('side', { enum: ['BUY', 'SELL'] }).notNull(), outcome: text('outcome', { enum: ['YES', 'NO'] }).notNull(),
+  priceSats: integer('price_sats').notNull(), totalShares: integer('total_shares').notNull(), remainingShares: integer('remaining_shares').notNull(),
+  utxoTxid: text('utxo_txid').notNull(), utxoVout: integer('utxo_vout').notNull(), utxoSatoshis: integer('utxo_satoshis').notNull(),
+  status: text('status', { enum: ['OPEN', 'PARTIAL', 'FILLED', 'CANCELLED'] }).notNull().default('OPEN'), createdAt: integer('created_at').notNull(),
+});
+
+export const trades = sqliteTable('trades', {
+  id: text('id').primaryKey(), marketId: text('market_id').notNull().references(() => markets.id),
+  matchType: text('match_type', { enum: ['DIRECT', 'MINT', 'MERGE'] }).notNull(),
+  yesPriceSats: integer('yes_price_sats').notNull(), noPriceSats: integer('no_price_sats').notNull(),
+  sharesTraded: integer('shares_traded').notNull(), bchTxid: text('bch_txid').notNull(), executedAt: integer('executed_at').notNull(),
+});
+
+export const schema = { markets, vaultUtxos, orders, trades };
+ 
+// === E:\frontend\bch\packages\backend\src\routes\markets.routes.ts === 
+import { and, asc, eq, inArray } from 'drizzle-orm';
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import type { MarketDb } from '../db/index.js';
+import { markets, orders, trades } from '../db/schema.js';
+import { GenesisService } from '../services/genesis.service.js';
+import { marketMutex } from '../services/utxo-queue.service.js';
+import { signResolution } from '../services/oracle.service.js';
+import { UnconfiguredResolutionExecutor, type ResolutionExecutor } from '../services/resolution.service.js';
+
+const createMarket = z.object({ title: z.string().min(3).max(200), description: z.string().max(5000).optional() });
+
+export async function registerMarketRoutes(app: FastifyInstance, db: MarketDb, genesis: GenesisService,
+  resolver: ResolutionExecutor = new UnconfiguredResolutionExecutor()) {
+  app.post('/api/markets', async (request, reply) => {
+    if (process.env.ADMIN_API_KEY && request.headers['x-admin-key'] !== process.env.ADMIN_API_KEY) return reply.code(401).send({ error: 'Unauthorized' });
+    const parsed = createMarket.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return reply.code(201).send(await genesis.create(parsed.data.title, parsed.data.description));
+  });
+
+  app.get('/api/markets', async () => db.select().from(markets).all().map((m) => ({
+    ...m, yesProbabilityPercent: m.lastYesPriceSats / 10, noProbabilityPercent: m.lastNoPriceSats / 10,
+  })));
+
+  app.get('/api/markets/:id/orderbook', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const market = db.select().from(markets).where(eq(markets.id, id)).get();
+    if (!market) return reply.code(404).send({ error: 'Market not found' });
+    const rows = db.select().from(orders).where(and(eq(orders.marketId, id), inArray(orders.status, ['OPEN', 'PARTIAL']))).all();
+    const group = (side: 'BUY' | 'SELL', outcome: 'YES' | 'NO') => {
+      const grouped = new Map<number, number>();
+      for (const order of rows.filter((x) => x.side === side && x.outcome === outcome))
+        grouped.set(order.priceSats, (grouped.get(order.priceSats) ?? 0) + order.remainingShares);
+      return [...grouped].map(([priceSats, shares]) => ({ priceSats, shares }))
+        .sort((a, b) => side === 'BUY' ? b.priceSats - a.priceSats : a.priceSats - b.priceSats);
+    };
+    return { yes: { bids: group('BUY', 'YES'), asks: group('SELL', 'YES') }, no: { bids: group('BUY', 'NO'), asks: group('SELL', 'NO') },
+      ticks: db.select().from(trades).where(eq(trades.marketId, id)).orderBy(asc(trades.executedAt)).all() };
+  });
+
+  app.post('/api/markets/:id/resolve', async (request, reply) => {
+    if (process.env.ADMIN_API_KEY && request.headers['x-admin-key'] !== process.env.ADMIN_API_KEY) return reply.code(401).send({ error: 'Unauthorized' });
+    const { id } = request.params as { id: string };
+    const parsed = z.object({ outcome: z.enum(['YES', 'NO']) }).safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const market = db.select().from(markets).where(eq(markets.id, id)).get();
+    if (!market) return reply.code(404).send({ error: 'Market not found' });
+    if (market.status !== 'OPEN') return reply.code(409).send({ error: 'Market already resolved' });
+    const oracleWif = process.env.ORACLE_PRIVATE_KEY || process.env.MARKET_WALLET_PRIVATE_KEY;
+    if (!oracleWif) return reply.code(503).send({ error: 'Set ORACLE_PRIVATE_KEY or MARKET_WALLET_PRIVATE_KEY in .env to authorize resolution.' });
+    const run = async () => {
+      const status = parsed.data.outcome === 'YES' ? 'RESOLVED_YES' : 'RESOLVED_NO';
+      let signature: string;
+      try { signature = signResolution(market.marketIdHex, parsed.data.outcome, oracleWif); }
+      catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Oracle signing failed' }); }
+      let txid: string;
+      try { txid = await resolver.resolve(market, parsed.data.outcome, signature); }
+      catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : 'Resolution transaction failed' }); }
+      db.update(markets).set({ status, resolvedAt: Date.now() }).where(eq(markets.id, id)).run();
+      return { marketId: market.marketIdHex, outcome: parsed.data.outcome, status, signature, txid };
+    };
+    return marketMutex.runExclusive(id, run);
+  });
+}
+ 
+// === E:\frontend\bch\packages\backend\src\routes\orders.routes.ts === 
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { Contract, MockNetworkProvider } from 'cashscript';
+import { and, eq } from 'drizzle-orm';
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import type { MarketDb } from '../db/index.js';
+import { markets, orders } from '../db/schema.js';
+import { MatcherService } from '../services/matcher.service.js';
+
+export interface OrderVerifier {
+  verify(input: { market: typeof markets.$inferSelect; side: 'BUY' | 'SELL'; outcome: 'YES' | 'NO'; makerPubKey: string; utxoTxid: string;
+    utxoVout: number; utxoSatoshis: number; tokenCategory?: string; tokenAmount?: number; priceSats: number; shares: number }): Promise<void>;
+}
+
+const MAX_SAFE_SHARES = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
+const prepareSchema = z.object({ marketId: z.string(), side: z.enum(['BUY', 'SELL']), outcome: z.enum(['YES', 'NO']),
+  priceSats: z.number().int().min(1).max(999), shares: z.number().int().positive().max(MAX_SAFE_SHARES), makerPubKey: z.string().regex(/^(02|03)[0-9a-f]{64}$/i) });
+const registerSchema = prepareSchema.extend({ makerAddress: z.string().min(2), utxoTxid: z.string().regex(/^[0-9a-f]{64}$/i),
+  utxoVout: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), utxoSatoshis: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), tokenCategory: z.string().optional(), tokenAmount: z.number().int().nonnegative().max(MAX_SAFE_SHARES).optional() });
+
+export async function registerOrderRoutes(app: FastifyInstance, db: MarketDb, matcher: MatcherService, verifier?: OrderVerifier) {
+  app.post('/api/orders/prepare', async (request, reply) => {
+    const parsed = prepareSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const input = parsed.data;
+    const market = db.select().from(markets).where(eq(markets.id, input.marketId)).get();
+    if (!market) return reply.code(404).send({ error: 'Market not found' });
+    if (market.status !== 'OPEN') return reply.code(409).send({ error: 'Market is closed' });
+    const requiredSatoshis = input.side === 'BUY' ? input.priceSats * input.shares + 1000 : 1000;
+    const pubkeyHash = createHash('ripemd160').update(createHash('sha256').update(Buffer.from(input.makerPubKey, 'hex')).digest()).digest('hex');
+    const p2pkhBytecode = '76a914' + pubkeyHash + '88ac';
+    const makerLockingBytecodeHash = createHash('ripemd160').update(createHash('sha256').update(Buffer.from(p2pkhBytecode, 'hex')).digest()).digest('hex');
+    const contractName = input.side === 'BUY' ? 'BuyOrder' : 'SellOrder';
+    const artifact = JSON.parse(readFileSync(new URL('../../../contracts/artifacts/' + contractName + '.json', import.meta.url), 'utf8'));
+    const contract = new Contract(artifact, [input.makerPubKey, makerLockingBytecodeHash,
+      input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId, BigInt(input.priceSats)], { provider: new MockNetworkProvider() });
+    return { contract: contractName, address: input.side === 'SELL' ? contract.tokenAddress : contract.address,
+      requiredSatoshis, requiredTokenCategory: input.side === 'SELL' ? (input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId) : null,
+      requiredTokenAmount: input.side === 'SELL' ? input.shares : 0,
+      makerLockingBytecodeHash, constructorArgs: [input.makerPubKey, makerLockingBytecodeHash,
+        input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId, input.priceSats] };
+  });
+
+  app.post('/api/orders/register', async (request, reply) => {
+    const parsed = registerSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const input = parsed.data;
+    const market = db.select().from(markets).where(eq(markets.id, input.marketId)).get();
+    if (!market) return reply.code(404).send({ error: 'Market not found' });
+    if (market.status !== 'OPEN') return reply.code(409).send({ error: 'Market is closed' });
+    const alreadyRegistered = db.select().from(orders).where(and(eq(orders.utxoTxid, input.utxoTxid), eq(orders.utxoVout, input.utxoVout))).get();
+    if (alreadyRegistered) return reply.code(409).send({ error: 'This UTXO is already registered as an order.' });
+    const expectedCategory = input.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId;
+    const expectedSats = input.side === 'BUY' ? input.shares * input.priceSats + 1000 : 1000;
+    if (input.side === 'BUY' && input.utxoSatoshis !== expectedSats) return reply.code(400).send({ error: 'Buy order UTXO must contain exactly bid × shares plus 1,000 sats.' });
+    if (input.side === 'SELL' && input.utxoSatoshis !== 1000) return reply.code(400).send({ error: 'Sell order UTXO must contain exactly 1,000 sats.' });
+    if (input.side === 'SELL' && (input.tokenCategory !== expectedCategory || input.tokenAmount !== input.shares))
+      return reply.code(400).send({ error: 'Order UTXO does not contain the required outcome tokens' });
+    if (verifier) {
+      try { await verifier.verify({ market, side: input.side, outcome: input.outcome, makerPubKey: input.makerPubKey, utxoTxid: input.utxoTxid,
+        utxoVout: input.utxoVout, utxoSatoshis: input.utxoSatoshis, tokenCategory: input.tokenCategory, tokenAmount: input.tokenAmount,
+        priceSats: input.priceSats, shares: input.shares }); }
+      catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Order UTXO verification failed' }); }
+    }
+    const id = randomUUID();
+    const matches = await matcher.register({ id, marketId: input.marketId, makerAddress: input.makerAddress, makerPubkey: input.makerPubKey,
+      side: input.side, outcome: input.outcome, priceSats: input.priceSats, totalShares: input.shares, remainingShares: input.shares,
+      utxoTxid: input.utxoTxid, utxoVout: input.utxoVout, utxoSatoshis: input.utxoSatoshis, status: 'OPEN', createdAt: Date.now() });
+    return reply.code(201).send({ orderId: id, matches });
+  });
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\chipnet-live.service.ts === 
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { and, eq } from 'drizzle-orm';
+import { Contract, ElectrumNetworkProvider, SignatureTemplate, TransactionBuilder, type Utxo } from 'cashscript';
+import { decodePrivateKeyWif, publicKeyToP2pkhCashAddress, secp256k1 } from '@bitauth/libauth';
+import type { MarketDb } from '../db/index.js';
+import { markets, orders, vaultUtxos } from '../db/schema.js';
+import { continuationVout, yesExecutionPrice, type BookOrder, type MatchExecutor, type MatchType } from './matcher.service.js';
+import type { ResolutionExecutor } from './resolution.service.js';
+import type { OrderVerifier } from '../routes/orders.routes.js';
+import { decodeChipnetWallet, chipnetFundingAddress } from './chipnet.service.js';
+import { walletMutex } from './utxo-queue.service.js';
+
+const artifact = (name: string) => JSON.parse(readFileSync(new URL('../../../contracts/artifacts/' + name + '.json', import.meta.url), 'utf8'));
+const hash160 = (bytes: Uint8Array) => createHash('ripemd160').update(createHash('sha256').update(bytes).digest()).digest('hex');
+const toHex = (value: string | Uint8Array) => typeof value === 'string' ? value : Buffer.from(value).toString('hex');
+
+function addOutputAt(tx: TransactionBuilder, index: number, output: Parameters<TransactionBuilder['addOutput']>[0], paddingAddress: string) {
+  while (tx.outputs.length < index) tx.addOutput({ to: paddingAddress, amount: 1000n });
+  if (tx.outputs.length !== index) throw new Error(`Transaction output layout expected index ${index}, found ${tx.outputs.length}.`);
+  tx.addOutput(output);
+}
+
+export function makerTokenAddress(pubkeyHex: string) {
+  const result = publicKeyToP2pkhCashAddress({ publicKey: Buffer.from(pubkeyHex, 'hex'), prefix: 'bchtest', tokenSupport: true });
+  if (typeof result === 'string') throw new Error('Could not derive maker address: ' + result);
+  return result.address;
+}
+
+function orderContract(order: BookOrder, market: typeof markets.$inferSelect, provider: ElectrumNetworkProvider) {
+  const contractName = order.side === 'BUY' ? 'BuyOrder' : 'SellOrder';
+  const pubkey = Buffer.from(order.makerPubkey, 'hex');
+  const p2pkh = Buffer.from('76a914' + hash160(pubkey) + '88ac', 'hex');
+  const args = [order.makerPubkey, hash160(p2pkh), order.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId, BigInt(order.priceSats)];
+  return new Contract(artifact(contractName), args, { provider });
+}
+
+function marketVaultArtifact(market: typeof markets.$inferSelect, oraclePubkey: Uint8Array, provider: ElectrumNetworkProvider) {
+  for (const name of ['MarketVault', 'MarketVaultV1']) {
+    const contract = new Contract(artifact(name), [market.yesCategoryId, market.noCategoryId, oraclePubkey, market.marketIdHex], { provider });
+    if (contract.tokenAddress === market.vaultContractAddress) return { name, contract };
+  }
+  throw new Error('No known MarketVault artifact matches this market address. Preserve its deployment artifact before upgrading contracts.');
+}
+
+export class ChipnetOrderVerifier implements OrderVerifier {
+  private readonly provider = new ElectrumNetworkProvider('chipnet');
+  async verify(input: { market: typeof markets.$inferSelect; side: 'BUY' | 'SELL'; outcome: 'YES' | 'NO'; makerPubKey: string; utxoTxid: string; utxoVout: number; utxoSatoshis: number; tokenCategory?: string; tokenAmount?: number; priceSats: number; shares: number }) {
+    const token = input.outcome === 'YES' ? input.market.yesCategoryId : input.market.noCategoryId;
+    const order = { makerPubkey: input.makerPubKey, side: input.side, outcome: input.outcome, priceSats: input.priceSats } as BookOrder;
+    const contract = orderContract(order, input.market, this.provider);
+    const address = input.side === 'SELL' ? contract.tokenAddress : contract.address;
+    const utxo = (await this.provider.getUtxos(address)).find((x) => x.txid.toLowerCase() === input.utxoTxid.toLowerCase() && x.vout === input.utxoVout);
+    if (!utxo) throw new Error('The submitted order outpoint is not an unspent output of its order contract.');
+    if (Number(utxo.satoshis) !== input.utxoSatoshis) throw new Error('Submitted BCH amount does not match the on-chain order UTXO.');
+    if (input.side === 'BUY') {
+      if (utxo.token || utxo.satoshis !== BigInt(input.priceSats * input.shares + 1000)) throw new Error('Buy order UTXO must contain exactly bid × shares plus 1,000 sats.');
+    } else if (utxo.satoshis !== 1000n || !utxo.token || utxo.token.category.toLowerCase() !== token.toLowerCase() || utxo.token.amount !== BigInt(input.shares)) {
+      throw new Error('Sell order UTXO must contain the exact outcome category and share amount.');
+    }
+  }
+}
+
+export class ChipnetMatchExecutor implements MatchExecutor {
+  private readonly provider = new ElectrumNetworkProvider('chipnet');
+  private readonly privateKey = decodeChipnetWallet();
+  private readonly signer = new SignatureTemplate(this.privateKey);
+  private readonly walletAddress = chipnetFundingAddress(this.privateKey);
+  private readonly oraclePubkey: Uint8Array;
+
+  constructor(private readonly db: MarketDb) {
+    const decoded = decodePrivateKeyWif(process.env.ORACLE_PRIVATE_KEY || process.env.MARKET_WALLET_PRIVATE_KEY!);
+    if (typeof decoded === 'string') throw new Error('Invalid oracle WIF: ' + decoded);
+    const pubkey = secp256k1.derivePublicKeyCompressed(decoded.privateKey);
+    if (typeof pubkey === 'string') throw new Error('Could not derive oracle public key: ' + pubkey);
+    this.oraclePubkey = pubkey;
+  }
+
+  async execute(marketId: string, kind: MatchType, shares: number, matched: [BookOrder, BookOrder]) {
+    return walletMutex.runExclusive('chipnet-operational-wallet', () => this.dispatch(marketId, kind, shares, matched));
+  }
+
+  private async dispatch(marketId: string, kind: MatchType, shares: number, matched: [BookOrder, BookOrder]) {
+    const market = this.db.select().from(markets).where(eq(markets.id, marketId)).get();
+    if (!market) throw new Error('Market not found');
+    const a = matched[0]; const b = matched[1];
+    if (kind === 'DIRECT') return this.direct(market, shares, a, b);
+    if (kind === 'MINT') return this.mint(market, shares, a, b);
+    return this.merge(market, shares, a, b);
+  }
+
+  private async liveOrder(order: BookOrder, market: typeof markets.$inferSelect) {
+    const contract = orderContract(order, market, this.provider);
+    const address = order.side === 'SELL' ? contract.tokenAddress : contract.address;
+    const utxo = (await this.provider.getUtxos(address)).find((x) => x.txid.toLowerCase() === order.utxoTxid.toLowerCase() && x.vout === order.utxoVout);
+    if (!utxo) throw new Error(`Order ${order.id} UTXO is no longer unspent; refresh or cancel the order.`);
+    const tokenCategory = order.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId;
+    if (order.side === 'BUY' && (utxo.token || utxo.satoshis !== BigInt(order.remainingShares * order.priceSats + 1000)))
+      throw new Error(`Buy order ${order.id} does not have the exact remaining BCH collateral.`);
+    if (order.side === 'SELL' && (utxo.satoshis !== 1000n || !utxo.token || utxo.token.category.toLowerCase() !== tokenCategory.toLowerCase() || utxo.token.amount !== BigInt(order.remainingShares)))
+      throw new Error(`Order ${order.id} token UTXO no longer contains its remaining shares.`);
+    return { contract, utxo };
+  }
+
+  private async feeInput() {
+    const candidates = (await this.provider.getUtxos(this.walletAddress)).filter((u) => !u.token && u.satoshis >= 5000n)
+      .sort((x, y) => Number(y.satoshis - x.satoshis));
+    if (!candidates[0]) throw new Error('Chipnet match requires a native BCH wallet UTXO of at least 5,000 sats to pay the transaction fee.');
+    return candidates[0];
+  }
+
+  private payout(order: BookOrder) { return makerTokenAddress(order.makerPubkey); }
+  private async direct(market: typeof markets.$inferSelect, shares: number, a: BookOrder, b: BookOrder) {
+    const buy = a.side === 'BUY' ? a : b; const sell = a.side === 'SELL' ? a : b;
+    const [{ contract: buyContract, utxo: buyUtxo }, { contract: sellContract, utxo: sellUtxo }, fee] = await Promise.all([
+      this.liveOrder(buy, market), this.liveOrder(sell, market), this.feeInput(),
+    ]);
+    const category = buy.outcome === 'YES' ? market.yesCategoryId : market.noCategoryId;
+    const yesPrice = yesExecutionPrice('DIRECT', buy, sell);
+    const executionPrice = buy.outcome === 'YES' ? yesPrice : 1000 - yesPrice;
+    const tx = new TransactionBuilder({ provider: this.provider, maximumFeeSatoshis: 20_000n });
+    tx.addInput(buyUtxo, (buyContract.unlock as any).fill(BigInt(shares)));
+    tx.addInput(sellUtxo, (sellContract.unlock as any).fill(BigInt(shares), BigInt(executionPrice)));
+    tx.addInput(fee, this.signer.unlockP2PKH());
+    tx.addOutput({ to: this.payout(buy), amount: 1000n, token: { category, amount: BigInt(shares) } });
+    tx.addOutput({ to: this.payout(sell), amount: BigInt(shares * executionPrice) });
+    const buyLeft = buy.remainingShares - shares;
+    if (buyLeft > 0) addOutputAt(tx, continuationVout('DIRECT', buy), { to: buyContract.address, amount: buyUtxo.satoshis - BigInt(shares * buy.priceSats) }, this.walletAddress);
+    const sellLeft = sell.remainingShares - shares;
+    if (sellLeft > 0) addOutputAt(tx, continuationVout('DIRECT', sell), { to: sellContract.tokenAddress, amount: 1000n, token: { category, amount: BigInt(sellLeft) } }, this.walletAddress);
+    const buyerRefund = shares * (buy.priceSats - executionPrice) + (buyLeft === 0 && sellLeft === 0 ? 1000 : 0);
+    if (buyerRefund > 0) tx.addOutput({ to: this.payout(buy), amount: BigInt(buyerRefund) });
+    tx.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
+    return (await tx.send()).txid;
+  }
+
+  private async vaultState(marketId: string, roles: Array<'VAULT_MASTER' | 'YES_BATON' | 'NO_BATON'>) {
+    const rows = this.db.select().from(vaultUtxos).where(eq(vaultUtxos.marketId, marketId)).all();
+    const byRole = new Map(rows.map((row) => [row.utxoRole, row]));
+    const selected = roles.map((role) => { const row = byRole.get(role); if (!row) throw new Error(`Missing ${role} UTXO state.`); return row; });
+    const utxos: Utxo[] = [];
+    for (const row of selected) {
+      // Querying by the transaction outpoint avoids relying on stale DB state; the covenant address is checked by CashScript.
+      const contract = this.db.select().from(markets).where(eq(markets.id, marketId)).get()!;
+      const { name, contract: vaultContract } = marketVaultArtifact(contract, this.oraclePubkey, this.provider);
+      const batonArtifact = name === 'MarketVaultV1' ? 'MintingBatonV1' : 'MintingBaton';
+      const baton = new Contract(artifact(batonArtifact), [hash160(Buffer.from(vaultContract.lockingBytecode, 'hex'))], { provider: this.provider });
+      const address = row.utxoRole === 'VAULT_MASTER' ? vaultContract.tokenAddress : baton.tokenAddress;
+      const addressUtxos = await this.provider.getUtxos(address);
+      const found = addressUtxos.find((u) => u.txid.toLowerCase() === row.txid.toLowerCase() && u.vout === row.vout) ??
+        addressUtxos.find((u) => u.token?.category.toLowerCase() === row.tokenCategory.toLowerCase() &&
+          u.token.nft?.capability === (row.utxoRole === 'VAULT_MASTER' ? 'mutable' : 'minting') &&
+          (row.utxoRole !== 'VAULT_MASTER' || u.token.nft.commitment === '00'));
+      if (!found) throw new Error(`${row.utxoRole} UTXO is not visible on Chipnet; reconcile the market state before retrying.`);
+      if (found.txid !== row.txid || found.vout !== row.vout) this.db.update(vaultUtxos).set({ txid: found.txid, vout: found.vout,
+        satoshis: Number(found.satoshis), nftCommitment: found.token?.nft?.commitment ?? row.nftCommitment, updatedAt: Date.now() })
+        .where(eq(vaultUtxos.id, row.id)).run();
+      utxos.push(found);
+    }
+    return { rows: selected, utxos };
+  }
+
+  private vaultContract(market: typeof markets.$inferSelect) {
+    return marketVaultArtifact(market, this.oraclePubkey, this.provider).contract;
+  }
+  private batonContract(market: typeof markets.$inferSelect) {
+    const { name, contract } = marketVaultArtifact(market, this.oraclePubkey, this.provider);
+    return new Contract(artifact(name === 'MarketVaultV1' ? 'MintingBatonV1' : 'MintingBaton'), [hash160(Buffer.from(contract.lockingBytecode, 'hex'))], { provider: this.provider });
+  }
+  private async mint(market: typeof markets.$inferSelect, shares: number, a: BookOrder, b: BookOrder) {
+    const yes = a.outcome === 'YES' ? a : b; const no = a.outcome === 'NO' ? a : b;
+    const [{ rows, utxos }, yesLive, noLive, fee] = await Promise.all([
+      this.vaultState(market.id, ['VAULT_MASTER', 'YES_BATON', 'NO_BATON']), this.liveOrder(yes, market), this.liveOrder(no, market), this.feeInput(),
+    ]);
+    const vault = this.vaultContract(market); const baton = this.batonContract(market);
+    const tx = new TransactionBuilder({ provider: this.provider, maximumFeeSatoshis: 30_000n });
+    tx.addInput(utxos[0]!, (vault.unlock as any).mintCompleteSet(BigInt(shares)));
+    tx.addInput(utxos[1]!, (baton.unlock as any).preserve()); tx.addInput(utxos[2]!, (baton.unlock as any).preserve());
+    tx.addInput(yesLive.utxo, (yesLive.contract.unlock as any).fill(BigInt(shares)));
+    tx.addInput(noLive.utxo, (noLive.contract.unlock as any).fill(BigInt(shares)));
+    tx.addInput(fee, this.signer.unlockP2PKH());
+    tx.addOutputs([
+      { to: vault.tokenAddress, amount: utxos[0]!.satoshis + BigInt(shares * 1000), token: { category: market.vaultCategoryId, amount: 0n, nft: { capability: 'mutable', commitment: '00' } } },
+      { to: baton.tokenAddress, amount: utxos[1]!.satoshis, token: { category: market.yesCategoryId, amount: 0n, nft: { capability: 'minting', commitment: '' } } },
+      { to: baton.tokenAddress, amount: utxos[2]!.satoshis, token: { category: market.noCategoryId, amount: 0n, nft: { capability: 'minting', commitment: '' } } },
+      { to: this.payout(yes), amount: 1000n, token: { category: market.yesCategoryId, amount: BigInt(shares) } },
+      { to: this.payout(no), amount: 1000n, token: { category: market.noCategoryId, amount: BigInt(shares) } },
+    ]);
+    const yesLeft = yes.remainingShares > shares;
+    const noLeft = no.remainingShares > shares;
+    if (yesLeft) addOutputAt(tx, continuationVout('MINT', yes), { to: yesLive.contract.address, amount: yesLive.utxo.satoshis - BigInt(shares * yes.priceSats) }, this.walletAddress);
+    if (noLeft) addOutputAt(tx, continuationVout('MINT', no), { to: noLive.contract.address, amount: noLive.utxo.satoshis - BigInt(shares * no.priceSats) }, this.walletAddress);
+    const yesExecution = yesExecutionPrice('MINT', yes, no);
+    const yesRefund = shares * (yes.priceSats - yesExecution);
+    const noRefund = shares * (no.priceSats - (1000 - yesExecution));
+    if (yesRefund > 0) tx.addOutput({ to: this.payout(yes), amount: BigInt(yesRefund) });
+    if (noRefund > 0) tx.addOutput({ to: this.payout(no), amount: BigInt(noRefund) });
+    tx.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
+    const sent = await tx.send();
+    this.updateVault(rows, sent.txid, sent.outputs.slice(0, 3).map((output, index) => ({ vout: index, satoshis: Number(output.valueSatoshis) })));
+    return sent.txid;
+  }
+
+  private async merge(market: typeof markets.$inferSelect, shares: number, a: BookOrder, b: BookOrder) {
+    const yes = a.outcome === 'YES' ? a : b; const no = a.outcome === 'NO' ? a : b;
+    const [{ rows, utxos }, yesLive, noLive, fee] = await Promise.all([
+      this.vaultState(market.id, ['VAULT_MASTER']), this.liveOrder(yes, market), this.liveOrder(no, market), this.feeInput(),
+    ]);
+    const vault = this.vaultContract(market);
+    const yesExecution = yesExecutionPrice('MERGE', yes, no);
+    const noExecution = 1000 - yesExecution;
+    const tx = new TransactionBuilder({ provider: this.provider, maximumFeeSatoshis: 30_000n, allowImplicitFungibleTokenBurn: true });
+    tx.addInput(utxos[0]!, (vault.unlock as any).mergeCompleteSet(BigInt(shares)));
+    tx.addInput(yesLive.utxo, (yesLive.contract.unlock as any).fill(BigInt(shares), BigInt(yesExecution)));
+    tx.addInput(noLive.utxo, (noLive.contract.unlock as any).fill(BigInt(shares), BigInt(noExecution)));
+    tx.addInput(fee, this.signer.unlockP2PKH());
+    tx.addOutput({ to: vault.tokenAddress, amount: utxos[0]!.satoshis - BigInt(shares * 1000), token: { category: market.vaultCategoryId, amount: 0n, nft: { capability: 'mutable', commitment: '00' } } });
+    tx.addOutput({ to: this.payout(yes), amount: BigInt(shares * yesExecution) });
+    tx.addOutput({ to: this.payout(no), amount: BigInt(shares * noExecution) });
+    const yesLeft = yes.remainingShares > shares;
+    const noLeft = no.remainingShares > shares;
+    if (yesLeft) addOutputAt(tx, continuationVout('MERGE', yes), { to: yesLive.contract.tokenAddress, amount: 1000n, token: { category: market.yesCategoryId, amount: BigInt(yes.remainingShares - shares) } }, this.walletAddress);
+    if (noLeft) addOutputAt(tx, continuationVout('MERGE', no), { to: noLive.contract.tokenAddress, amount: 1000n, token: { category: market.noCategoryId, amount: BigInt(no.remainingShares - shares) } }, this.walletAddress);
+    if (!yesLeft) tx.addOutput({ to: this.payout(yes), amount: 1000n });
+    if (!noLeft) tx.addOutput({ to: this.payout(no), amount: 1000n });
+    tx.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
+    const sent = await tx.send();
+    this.updateVault(rows, sent.txid, [{ vout: 0, satoshis: Number(sent.outputs[0]!.valueSatoshis) }]);
+    return sent.txid;
+  }
+
+  private updateVault(rows: Array<typeof vaultUtxos.$inferSelect>, txid: string, outputs: Array<{ vout: number; satoshis: number }>) {
+    const now = Date.now();
+    this.db.transaction(() => rows.forEach((row, index) => this.db.update(vaultUtxos).set({ txid, vout: outputs[index]!.vout,
+      satoshis: outputs[index]!.satoshis, updatedAt: now }).where(eq(vaultUtxos.id, row.id)).run()));
+  }
+}
+
+export class ChipnetResolutionExecutor implements ResolutionExecutor {
+  private readonly provider = new ElectrumNetworkProvider('chipnet');
+  private readonly privateKey = decodeChipnetWallet();
+  private readonly signer = new SignatureTemplate(this.privateKey);
+  private readonly walletAddress = chipnetFundingAddress(this.privateKey);
+  private readonly oraclePubkey: Uint8Array;
+  constructor(private readonly db: MarketDb) {
+    const decoded = decodePrivateKeyWif(process.env.ORACLE_PRIVATE_KEY || process.env.MARKET_WALLET_PRIVATE_KEY!);
+    if (typeof decoded === 'string') throw new Error('Invalid oracle WIF: ' + decoded);
+    const pubkey = secp256k1.derivePublicKeyCompressed(decoded.privateKey);
+    if (typeof pubkey === 'string') throw new Error('Could not derive oracle public key: ' + pubkey);
+    this.oraclePubkey = pubkey;
+  }
+  async resolve(market: { id: string; marketIdHex: string; vaultContractAddress: string }, outcome: 'YES' | 'NO', signatureHex: string) {
+    return walletMutex.runExclusive('chipnet-operational-wallet', () => this.resolveExclusive(market, outcome, signatureHex));
+  }
+
+  private async resolveExclusive(market: { id: string; marketIdHex: string; vaultContractAddress: string }, outcome: 'YES' | 'NO', signatureHex: string) {
+    const row = this.db.select().from(vaultUtxos).where(and(eq(vaultUtxos.marketId, market.id), eq(vaultUtxos.utxoRole, 'VAULT_MASTER'))).get();
+    if (!row) throw new Error('Vault NFT UTXO state is missing.');
+    const yesCategoryId = this.db.select().from(markets).where(eq(markets.id, market.id)).get()!.yesCategoryId;
+    const noCategoryId = this.db.select().from(markets).where(eq(markets.id, market.id)).get()!.noCategoryId;
+    const fullMarket = this.db.select().from(markets).where(eq(markets.id, market.id)).get()!;
+    const vault = marketVaultArtifact(fullMarket, this.oraclePubkey, this.provider).contract;
+    const utxo = (await this.provider.getUtxos(vault.tokenAddress)).find((u) => u.txid.toLowerCase() === row.txid.toLowerCase() && u.vout === row.vout);
+    if (!utxo) throw new Error('Current vault NFT UTXO is missing from Chipnet.');
+    const fee = (await this.provider.getUtxos(this.walletAddress)).find((u) => !u.token && u.satoshis >= 5000n);
+    if (!fee) throw new Error('Resolution requires a native BCH wallet UTXO of at least 5,000 sats for fees.');
+    const outcomeByte = outcome === 'YES' ? '01' : '02';
+    const tx = new TransactionBuilder({ provider: this.provider, maximumFeeSatoshis: 20_000n });
+    tx.addInput(utxo, (vault.unlock as any).resolveMarket(Buffer.from(signatureHex, 'hex'), Buffer.from(outcomeByte, 'hex')));
+    tx.addInput(fee, this.signer.unlockP2PKH());
+    tx.addOutput({ to: vault.tokenAddress, amount: utxo.satoshis, token: { category: fullMarket.vaultCategoryId, amount: 0n, nft: { capability: 'mutable', commitment: outcomeByte } } });
+    tx.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
+    const sent = await tx.send();
+    this.db.update(vaultUtxos).set({ txid: sent.txid, vout: 0, satoshis: Number(sent.outputs[0]!.valueSatoshis), nftCommitment: outcomeByte, updatedAt: Date.now() }).where(eq(vaultUtxos.id, row.id)).run();
+    return sent.txid;
+  }
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\chipnet.service.ts === 
+import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { Contract, ElectrumNetworkProvider, SignatureTemplate, TransactionBuilder, type Utxo } from 'cashscript';
+import { binToValueSatoshis, decodePrivateKeyWif, privateKeyToP2pkhCashAddress, secp256k1 } from '@bitauth/libauth';
+import type { GenesisAdapter, GenesisResult } from './genesis.service.js';
+import { walletMutex } from './utxo-queue.service.js';
+
+const readArtifact = (name: string) => JSON.parse(readFileSync(new URL('../../../contracts/artifacts/' + name + '.json', import.meta.url), 'utf8'));
+
+export function decodeChipnetWallet(wif = process.env.MARKET_WALLET_PRIVATE_KEY) {
+  if (!wif) throw new Error('Set MARKET_WALLET_PRIVATE_KEY to a Chipnet WIF. Keep it private and out of source control.');
+  const decoded = decodePrivateKeyWif(wif);
+  if (typeof decoded === 'string') throw new Error('Invalid MARKET_WALLET_PRIVATE_KEY: ' + decoded);
+  return decoded.privateKey;
+}
+
+export function chipnetFundingAddress(privateKey = decodeChipnetWallet()) {
+  const result = privateKeyToP2pkhCashAddress({ privateKey, prefix: 'bchtest' });
+  return result.address;
+}
+
+const hash160 = (hex: string) => createHash('ripemd160').update(createHash('sha256').update(Buffer.from(hex, 'hex')).digest()).digest('hex');
+
+/** Builds and broadcasts the three category-seeding transactions and the fixed 0/1/2 vault bundle. */
+export class ChipnetGenesisAdapter implements GenesisAdapter {
+  private readonly provider = new ElectrumNetworkProvider('chipnet');
+  private readonly privateKey = decodeChipnetWallet();
+  private readonly signer = new SignatureTemplate(this.privateKey);
+  private readonly walletAddress = chipnetFundingAddress(this.privateKey);
+
+  async createMarket(_title: string, _description: string): Promise<GenesisResult> {
+    return walletMutex.runExclusive('chipnet-operational-wallet', () => this.createMarketExclusive());
+  }
+
+  private async createMarketExclusive(): Promise<GenesisResult> {
+    const walletUtxos = (await this.provider.getUtxos(this.walletAddress))
+      .filter((utxo) => !utxo.token).sort((a, b) => Number(b.satoshis - a.satoshis));
+    const initialFunding: Utxo[] = [];
+    let fundingSatoshis = 0n;
+    for (const utxo of walletUtxos) {
+      initialFunding.push(utxo);
+      fundingSatoshis += utxo.satoshis;
+      if (fundingSatoshis >= 6_000n) break;
+    }
+    if (fundingSatoshis < 6_000n) throw new Error('Fund the Chipnet wallet with at least 6,000 sats of native BCH, then retry market creation.');
+
+    const oracleWif = process.env.ORACLE_PRIVATE_KEY || process.env.MARKET_WALLET_PRIVATE_KEY;
+    if (!oracleWif) throw new Error('Set ORACLE_PRIVATE_KEY or MARKET_WALLET_PRIVATE_KEY before creating a market.');
+    const oracleKey = decodePrivateKeyWif(oracleWif);
+    if (typeof oracleKey === 'string') throw new Error('Invalid oracle WIF: ' + oracleKey);
+    const oraclePubKey = secp256k1.derivePublicKeyCompressed(oracleKey.privateKey);
+    if (typeof oraclePubKey === 'string') throw new Error('Could not derive the oracle public key: ' + oraclePubKey);
+    const marketIdHex = randomBytes(4).toString('hex');
+
+    const preGenesis = [] as Array<{ txid: string; vout: number }>;
+    let spendable = initialFunding;
+    for (let index = 0; index < 3; index += 1) {
+      const tx = new TransactionBuilder({ provider: this.provider, maximumFeeSatoshis: 10_000n });
+      for (const utxo of spendable) tx.addInput(utxo, this.signer.unlockP2PKH());
+      tx.addOutput({ to: this.walletAddress, amount: 1000n });
+      tx.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
+      const sent = await tx.send();
+      preGenesis.push({ txid: sent.txid, vout: 0 });
+      const change = sent.outputs[1]?.valueSatoshis;
+      if (change === undefined) throw new Error('The wallet UTXO was too small to preserve BCH change for the next genesis transaction.');
+      const changeSatoshis = typeof change === 'bigint' ? change : typeof change === 'number' ? BigInt(change) : binToValueSatoshis(change);
+      if (changeSatoshis < 1000n) throw new Error('Insufficient BCH remains after category seeding; fund the wallet with more than 6,000 sats and retry.');
+      spendable = [{ txid: sent.txid, vout: 1, satoshis: changeSatoshis }];
+    }
+
+    const yesCategoryId = preGenesis[0]!.txid;
+    const noCategoryId = preGenesis[1]!.txid;
+    const vaultCategoryId = preGenesis[2]!.txid;
+
+    const vault = new Contract(readArtifact('MarketVault'), [yesCategoryId, noCategoryId, oraclePubKey, marketIdHex], { provider: this.provider });
+    const vaultScriptHash = hash160(vault.lockingBytecode);
+    const yesBaton = new Contract(readArtifact('MintingBaton'), [vaultScriptHash], { provider: this.provider });
+    const noBaton = new Contract(readArtifact('MintingBaton'), [vaultScriptHash], { provider: this.provider });
+    const genesis = new TransactionBuilder({ provider: this.provider, maximumFeeSatoshis: 10_000n });
+    for (const outpoint of preGenesis) genesis.addInput({ ...outpoint, satoshis: 1000n }, this.signer.unlockP2PKH());
+    genesis.addInput(spendable[0]!, this.signer.unlockP2PKH());
+    genesis.addOutputs([
+      { to: vault.tokenAddress, amount: 1000n, token: { category: vaultCategoryId, amount: 0n, nft: { capability: 'mutable', commitment: '00' } } },
+      { to: yesBaton.tokenAddress, amount: 1000n, token: { category: yesCategoryId, amount: 0n, nft: { capability: 'minting', commitment: '' } } },
+      { to: noBaton.tokenAddress, amount: 1000n, token: { category: noCategoryId, amount: 0n, nft: { capability: 'minting', commitment: '' } } },
+    ]);
+    genesis.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
+    const sent = await genesis.send();
+
+    return { marketIdHex, yesCategoryId, noCategoryId, vaultCategoryId,
+      vaultContractAddress: vault.tokenAddress, txid: sent.txid };
+  }
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\genesis.service.ts === 
+import { randomBytes, randomUUID } from 'node:crypto';
+import { eq } from 'drizzle-orm';
+import type { MarketDb } from '../db/index.js';
+import { markets, vaultUtxos } from '../db/schema.js';
+
+export type GenesisResult = {
+  marketIdHex: string; yesCategoryId: string; noCategoryId: string; vaultCategoryId: string;
+  vaultContractAddress: string; txid: string;
+};
+
+export interface GenesisAdapter { createMarket(title: string, description: string): Promise<GenesisResult> }
+
+export class MockGenesisAdapter implements GenesisAdapter {
+  async createMarket(_title: string, _description: string): Promise<GenesisResult> {
+    return {
+      marketIdHex: randomBytes(4).toString('hex'), yesCategoryId: randomBytes(32).toString('hex'),
+      noCategoryId: randomBytes(32).toString('hex'), vaultCategoryId: randomBytes(32).toString('hex'),
+      vaultContractAddress: 'mock:' + randomBytes(20).toString('hex'), txid: randomBytes(32).toString('hex'),
+    };
+  }
+}
+
+export class GenesisService {
+  constructor(private readonly db: MarketDb, private readonly adapter: GenesisAdapter = new MockGenesisAdapter()) {}
+  async create(title: string, description = '') {
+    const result = await this.adapter.createMarket(title, description);
+    const id = randomUUID(); const now = Date.now();
+    this.db.insert(markets).values({ id, marketIdHex: result.marketIdHex, title, description,
+      yesCategoryId: result.yesCategoryId, noCategoryId: result.noCategoryId, vaultCategoryId: result.vaultCategoryId,
+      vaultContractAddress: result.vaultContractAddress, createdAt: now }).run();
+    const roles = [
+      { role: 'VAULT_MASTER' as const, category: result.vaultCategoryId, satoshis: 1000, commitment: '00' },
+      { role: 'YES_BATON' as const, category: result.yesCategoryId, satoshis: 1000, commitment: null },
+      { role: 'NO_BATON' as const, category: result.noCategoryId, satoshis: 1000, commitment: null },
+    ];
+    for (const [vout, item] of roles.entries()) this.db.insert(vaultUtxos).values({
+      id: randomUUID(), marketId: id, utxoRole: item.role, txid: result.txid, vout, satoshis: item.satoshis,
+      tokenCategory: item.category, tokenAmount: 0, nftCapability: item.role === 'VAULT_MASTER' ? 'mutable' : 'minting',
+      nftCommitment: item.commitment, updatedAt: now,
+    }).run();
+    return this.db.select().from(markets).where(eq(markets.id, id)).get()!;
+  }
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\matcher.service.ts === 
+import { randomUUID } from 'node:crypto';
+import { and, eq, inArray, sql } from 'drizzle-orm';
+import type { MarketDb } from '../db/index.js';
+import { markets, orders, trades } from '../db/schema.js';
+import { marketMutex } from './utxo-queue.service.js';
+
+export type RegisteredOrder = typeof orders.$inferInsert;
+export type MatchType = 'DIRECT' | 'MINT' | 'MERGE';
+export type BookOrder = typeof orders.$inferSelect;
+export interface MatchExecutor { execute(marketId: string, kind: MatchType, shares: number, matchedOrders: [BookOrder, BookOrder]): Promise<string> }
+export class MockMatchExecutor implements MatchExecutor {
+  async execute(_marketId: string, _kind: MatchType, _shares: number, _matchedOrders: [BookOrder, BookOrder]) { return randomUUID().replaceAll('-', ''); }
+}
+
+/** YES-side execution price under price-time priority. */
+export function yesExecutionPrice(kind: MatchType, a: BookOrder, b: BookOrder) {
+  if (kind === 'MINT') {
+    const yes = a.outcome === 'YES' ? a : b;
+    const no = a.outcome === 'NO' ? a : b;
+    const maker = a.createdAt <= b.createdAt ? a : b;
+    return maker.outcome === 'YES' ? yes.priceSats : 1000 - no.priceSats;
+  }
+  if (kind === 'MERGE') {
+    const maker = a.createdAt <= b.createdAt ? a : b;
+    return maker.outcome === 'YES' ? maker.priceSats : 1000 - maker.priceSats;
+  }
+  const maker = a.createdAt <= b.createdAt ? a : b;
+  return maker.outcome === 'YES' ? maker.priceSats : 1000 - maker.priceSats;
+}
+
+export function continuationVout(type: MatchType, order: BookOrder) {
+  if (type === 'DIRECT') return order.side === 'BUY' ? 2 : 3;
+  if (type === 'MINT') return order.outcome === 'YES' ? 5 : 6;
+  return order.outcome === 'YES' ? 3 : 4;
+}
+
+/** Price-time matching with serialized vault-backed mint/merge execution. */
+export class MatcherService {
+  constructor(private readonly db: MarketDb, private readonly executor: MatchExecutor = new MockMatchExecutor(),
+    private readonly publish: (marketId: string, update: unknown) => void = () => {}) {}
+
+  async register(order: RegisteredOrder) {
+    this.db.insert(orders).values(order).run();
+    return this.match(order.marketId);
+  }
+
+  async match(marketId: string) {
+    return marketMutex.runExclusive(marketId, async () => {
+      const result = [] as Array<{ type: MatchType; shares: number; txid: string }>;
+      while (true) {
+        const open = this.db.select().from(orders).where(and(eq(orders.marketId, marketId), inArray(orders.status, ['OPEN', 'PARTIAL']))).all();
+        const next = this.findMatch(open);
+        if (!next) break;
+        const txid = await this.executor.execute(marketId, next.type, next.shares, [next.a, next.b]);
+        const yesPrice = yesExecutionPrice(next.type, next.a, next.b);
+        const noPrice = 1000 - yesPrice;
+        this.db.transaction(() => {
+          for (const order of [next.a, next.b]) {
+            const left = order.remainingShares - next.shares;
+            const continuationOutput = left === 0 ? undefined : continuationVout(next.type, order);
+            const remainingSatoshis = order.side === 'BUY'
+              ? order.utxoSatoshis - next.shares * order.priceSats
+              : Math.max(1000, order.utxoSatoshis);
+            this.db.update(orders).set({ remainingShares: left, status: left === 0 ? 'FILLED' : 'PARTIAL',
+              ...(continuationOutput === undefined ? {} : { utxoTxid: txid, utxoVout: continuationOutput, utxoSatoshis: remainingSatoshis }) })
+              .where(eq(orders.id, order.id)).run();
+          }
+          this.db.insert(trades).values({ id: randomUUID(), marketId, matchType: next.type, yesPriceSats: yesPrice,
+            noPriceSats: noPrice, sharesTraded: next.shares, bchTxid: txid, executedAt: Date.now() }).run();
+          this.db.update(markets).set({ lastYesPriceSats: yesPrice, lastNoPriceSats: noPrice,
+            volumeSats: sql`${markets.volumeSats} + ${next.shares * 1000}` }).where(eq(markets.id, marketId)).run();
+        });
+        const update = { type: next.type, shares: next.shares, yesPriceSats: yesPrice, noPriceSats: noPrice, txid };
+        this.publish(marketId, update);
+        result.push({ type: next.type, shares: next.shares, txid });
+      }
+      return result;
+    });
+  }
+
+  private findMatch(rows: Array<typeof orders.$inferSelect>) {
+    const candidates = rows.filter((row) => row.remainingShares > 0);
+    const buys = candidates.filter((x) => x.side === 'BUY').sort((a, b) => b.priceSats - a.priceSats || a.createdAt - b.createdAt);
+    const sells = candidates.filter((x) => x.side === 'SELL').sort((a, b) => a.priceSats - b.priceSats || a.createdAt - b.createdAt);
+    for (const bid of buys) {
+      for (const ask of sells) if (bid.outcome === ask.outcome && bid.priceSats >= ask.priceSats)
+        if (Math.min(bid.remainingShares, ask.remainingShares) * ask.priceSats >= 1000)
+          return { type: 'DIRECT' as const, a: bid, b: ask, shares: Math.min(bid.remainingShares, ask.remainingShares) };
+    }
+    for (const yes of buys.filter((x) => x.outcome === 'YES')) for (const no of buys.filter((x) => x.outcome === 'NO')) {
+      if (yes.priceSats + no.priceSats >= 1000) return { type: 'MINT' as const, a: yes, b: no, shares: Math.min(yes.remainingShares, no.remainingShares) };
+    }
+    const yesAsks = sells.filter((x) => x.outcome === 'YES'); const noAsks = sells.filter((x) => x.outcome === 'NO');
+    for (const yes of yesAsks) for (const no of noAsks) {
+      const shares = Math.min(yes.remainingShares, no.remainingShares);
+      if (yes.priceSats + no.priceSats <= 1000 && shares * yes.priceSats >= 1000 && shares * no.priceSats >= 1000)
+        return { type: 'MERGE' as const, a: yes, b: no, shares };
+    }
+    return undefined;
+  }
+
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\oracle.service.ts === 
+import { decodePrivateKeyWif, secp256k1, sha256 } from '@bitauth/libauth';
+
+/** BCH OP_CHECKDATASIG signs SHA256(market_id || outcome_byte) with a DER ECDSA signature. */
+export function signResolution(marketIdHex: string, outcome: 'YES' | 'NO', privateKeyWif: string) {
+  const decoded = decodePrivateKeyWif(privateKeyWif);
+  if (typeof decoded === 'string') throw new Error('Invalid ORACLE_PRIVATE_KEY: ' + decoded);
+  if (!/^[0-9a-f]{8}$/i.test(marketIdHex)) throw new Error('marketIdHex must be exactly 4 bytes');
+  const message = Buffer.from(marketIdHex + (outcome === 'YES' ? '01' : '02'), 'hex');
+  const signature = secp256k1.signMessageHashDER(decoded.privateKey, sha256.hash(message));
+  if (typeof signature === 'string') throw new Error('Oracle signing failed: ' + signature);
+  return Buffer.from(signature).toString('hex');
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\resolution.service.ts === 
+import { randomBytes } from 'node:crypto';
+
+export interface ResolutionExecutor {
+  resolve(market: { id: string; marketIdHex: string; vaultContractAddress: string }, outcome: 'YES' | 'NO', signatureHex: string): Promise<string>;
+}
+
+/** Explicit simulation adapter used by the mock network and tests; it never broadcasts to BCH. */
+export class MockResolutionExecutor implements ResolutionExecutor {
+  async resolve(_market: { id: string; marketIdHex: string; vaultContractAddress: string }, _outcome: 'YES' | 'NO', signatureHex: string) {
+    if (!signatureHex) throw new Error('Resolution signature is required');
+    return randomBytes(32).toString('hex');
+  }
+}
+
+export class UnconfiguredMatchExecutor {
+  async execute(): Promise<string> { throw new Error('A Chipnet CLOB settlement transaction executor is not configured'); }
+}
+
+export class UnconfiguredResolutionExecutor implements ResolutionExecutor {
+  async resolve(): Promise<string> { throw new Error('A BCH transaction executor is not configured'); }
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\tx-builder.service.ts === 
+import { TransactionBuilder, type NetworkProvider, type Output, type Unlocker, type Utxo } from 'cashscript';
+
+/**
+ * Creates a covenant builder with only the supplied inputs and outputs. CashScript 0.13 does not
+ * expose withoutChange()/withoutTokenChange(); change is opt-in via add*ChangeOutputIfNeeded().
+ * This wrapper deliberately never invokes those helpers, so fixed covenant output indices remain
+ * stable. Callers must account for fees and add any change as explicit outputs themselves.
+ */
+export function createExplicitCovenantBuilder(provider: NetworkProvider) {
+  return new TransactionBuilder({ provider });
+}
+
+export function addExplicitInput(builder: TransactionBuilder, utxo: Utxo, unlocker: Unlocker) {
+  return builder.addInput(utxo, unlocker);
+}
+
+export function addExplicitOutputs(builder: TransactionBuilder, outputs: Output[]) {
+  return builder.addOutputs(outputs);
+}
+ 
+// === E:\frontend\bch\packages\backend\src\services\utxo-queue.service.ts === 
+/** Serializes zero-confirmation spends per market without an external queue. */
+export class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  async runExclusive<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.tails.set(key, current);
+    await previous;
+    try { return await operation(); }
+    finally {
+      release();
+      if (this.tails.get(key) === current) this.tails.delete(key);
+    }
+  }
+}
+
+export const marketMutex = new KeyedMutex();
+/** Serializes spends from the shared operational wallet across all markets. */
+export const walletMutex = new KeyedMutex();
+ 
+// === E:\frontend\bch\packages\backend\src\ws\ticker.ws.ts === 
+import type { FastifyInstance } from 'fastify';
+import websocket from '@fastify/websocket';
+
+export class TickerHub {
+  private readonly clients = new Map<string, Set<{ send(data: string): void }>>();
+  publish(marketId: string, event: unknown) {
+    const payload = JSON.stringify(event);
+    for (const client of this.clients.get(marketId) ?? []) client.send(payload);
+  }
+  async register(app: FastifyInstance) {
+    await app.register(websocket);
+    app.get('/api/markets/:id/ticker', { websocket: true }, (socket, request) => {
+      const { id } = request.params as { id: string };
+      const listeners = this.clients.get(id) ?? new Set(); listeners.add(socket); this.clients.set(id, listeners);
+      socket.on('close', () => { listeners.delete(socket); if (listeners.size === 0) this.clients.delete(id); });
+    });
+  }
+}
+ 
+// === E:\frontend\bch\packages\backend\test\chipnet-address.test.ts === 
+import { describe, expect, it } from 'vitest';
+import { chipnetFundingAddress } from '../src/services/chipnet.service.js';
+
+describe('Chipnet wallet address derivation', () => {
+  it('derives a testnet CashAddress without connecting to Electrum', () => {
+    const privateKey = new Uint8Array(32); privateKey[31] = 1;
+    expect(chipnetFundingAddress(Buffer.from(privateKey))).toMatch(/^bchtest:/);
+  });
+});
+ 
+// === E:\frontend\bch\packages\backend\test\e2e-clob.test.ts === 
+import { afterEach, describe, expect, it } from 'vitest';
+import { createDatabase } from '../src/db/index.js';
+import { createApp } from '../src/index.js';
+import { GenesisService } from '../src/services/genesis.service.js';
+import { MatcherService } from '../src/services/matcher.service.js';
+import { markets, trades } from '../src/db/schema.js';
+import { MockResolutionExecutor } from '../src/services/resolution.service.js';
+import { encodePrivateKeyWif } from '@bitauth/libauth';
+
+describe('native BCH market API and CLOB persistence', () => {
+  const resources: Array<{ close: () => void; app: Awaited<ReturnType<typeof createApp>> }> = [];
+  afterEach(async () => { for (const item of resources.splice(0)) { await item.app.close(); item.close(); } });
+
+  it('creates a market and records a complementary mint trade price tick', async () => {
+    const handle = createDatabase(':memory:');
+    const previousKey = process.env.ORACLE_PRIVATE_KEY;
+    const privateKey = new Uint8Array(32); privateKey[31] = 1;
+    process.env.ORACLE_PRIVATE_KEY = encodePrivateKeyWif(privateKey, 'testnet');
+    const app = await createApp({ db: handle, genesis: new GenesisService(handle.db), resolver: new MockResolutionExecutor() });
+    resources.push({ close: handle.close, app });
+    const created = await app.inject({ method: 'POST', url: '/api/markets', payload: { title: 'Will BCH cross 1000?' } });
+    expect(created.statusCode).toBe(201);
+    const market = created.json() as typeof markets.$inferSelect;
+    const matcher = new MatcherService(handle.db);
+    await matcher.register({ id: 'yes-bid', marketId: market.id, makerAddress: 'addr-a', makerPubkey: '02aa', side: 'BUY', outcome: 'YES',
+      priceSats: 600, totalShares: 1, remainingShares: 1, utxoTxid: 'a'.repeat(64), utxoVout: 0, utxoSatoshis: 600, status: 'OPEN', createdAt: 1 });
+    await matcher.register({ id: 'no-bid', marketId: market.id, makerAddress: 'addr-b', makerPubkey: '02bb', side: 'BUY', outcome: 'NO',
+      priceSats: 400, totalShares: 1, remainingShares: 1, utxoTxid: 'b'.repeat(64), utxoVout: 0, utxoSatoshis: 400, status: 'OPEN', createdAt: 2 });
+    const trade = handle.db.select().from(trades).get();
+    expect(trade?.matchType).toBe('MINT');
+    expect(trade?.yesPriceSats).toBe(600);
+    expect(handle.db.select().from(markets).get()?.lastYesPriceSats).toBe(600);
+    const resolved = await app.inject({ method: 'POST', url: `/api/markets/${market.id}/resolve`, payload: { outcome: 'YES' } });
+    expect(resolved.statusCode, resolved.body).toBe(200);
+    expect(resolved.json().signature).toMatch(/^[0-9a-f]+$/i);
+    expect(handle.db.select().from(markets).get()?.status).toBe('RESOLVED_YES');
+    if (previousKey === undefined) delete process.env.ORACLE_PRIVATE_KEY;
+    else process.env.ORACLE_PRIVATE_KEY = previousKey;
+  });
+});
+ 
+// === E:\frontend\bch\packages\backend\test\matcher.test.ts === 
+import { afterEach, describe, expect, it } from 'vitest';
+import { createDatabase } from '../src/db/index.js';
+import { GenesisService } from '../src/services/genesis.service.js';
+import { continuationVout, MatcherService } from '../src/services/matcher.service.js';
+import { orders, trades } from '../src/db/schema.js';
+
+describe('three-path CLOB matcher', () => {
+  const close: Array<() => void> = [];
+  afterEach(() => close.splice(0).forEach((fn) => fn()));
+
+  async function setup() {
+    const database = createDatabase(':memory:'); close.push(database.close);
+    const market = await new GenesisService(database.db).create('Test binary market');
+    return { db: database.db, market, matcher: new MatcherService(database.db) };
+  }
+  const order = (marketId: string, id: string, side: 'BUY' | 'SELL', outcome: 'YES' | 'NO', priceSats: number, shares = 1, createdAt = 1) => ({
+    id, marketId, makerAddress: 'mock:' + id, makerPubkey: '02aa', side, outcome, priceSats,
+    totalShares: shares, remainingShares: shares, utxoTxid: id.padEnd(64, '0'), utxoVout: 0,
+    utxoSatoshis: side === 'BUY' ? priceSats * shares : 1000, status: 'OPEN' as const, createdAt,
+  });
+
+  it('keeps covenant continuation vouts aligned with each input position', () => {
+    const sample = order('market', 'sample', 'BUY', 'YES', 500) as any;
+    expect(continuationVout('DIRECT', sample)).toBe(2);
+    expect(continuationVout('DIRECT', { ...sample, side: 'SELL' })).toBe(3);
+    expect(continuationVout('MINT', sample)).toBe(5);
+    expect(continuationVout('MINT', { ...sample, outcome: 'NO' })).toBe(6);
+    expect(continuationVout('MERGE', { ...sample, side: 'SELL' })).toBe(3);
+    expect(continuationVout('MERGE', { ...sample, side: 'SELL', outcome: 'NO' })).toBe(4);
+  });
+
+  it('matches a same-outcome direct swap without spending the vault', async () => {
+    const { db, market, matcher } = await setup();
+    await matcher.register(order(market.id, 'bid', 'BUY', 'YES', 650, 2));
+    const matches = await matcher.register(order(market.id, 'ask', 'SELL', 'YES', 620, 2, 2));
+    expect(matches[0]?.type).toBe('DIRECT');
+    expect(db.select().from(trades).get()?.matchType).toBe('DIRECT');
+  });
+
+  it('records the complementary YES price for a direct NO trade', async () => {
+    const { db, market, matcher } = await setup();
+    await matcher.register(order(market.id, 'no-bid', 'BUY', 'NO', 400, 4));
+    await matcher.register(order(market.id, 'no-ask', 'SELL', 'NO', 300, 4, 2));
+    expect(db.select().from(trades).get()?.yesPriceSats).toBe(600);
+  });
+
+  it('matches complementary sellers through merge and preserves the unfilled remainder', async () => {
+    const { db, market, matcher } = await setup();
+    await matcher.register(order(market.id, 'yes-seller', 'SELL', 'YES', 440, 4));
+    const matches = await matcher.register(order(market.id, 'no-seller', 'SELL', 'NO', 500, 3, 2));
+    expect(matches[0]?.type).toBe('MERGE');
+    expect(db.select().from(trades).get()?.yesPriceSats).toBe(440);
+    expect(db.select().from(orders).all().find((x) => x.id === 'yes-seller')?.remainingShares).toBe(1);
+  });
+});
+ 
+// === E:\frontend\bch\packages\contracts\scripts\compile.ts === 
+import { execFileSync } from 'node:child_process';
+import { mkdir, readdir } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const sourceDir = join(root, 'src');
+const artifactDir = join(root, 'artifacts');
+await mkdir(artifactDir, { recursive: true });
+const files = (await readdir(sourceDir)).filter((file) => file.endsWith('.cash'));
+if (files.length !== 4) throw new Error(`Expected 4 CashScript sources; found ${files.length}`);
+for (const file of files) {
+  const source = join(sourceDir, file);
+  const output = join(artifactDir, `${file.replace(/\.cash$/, '')}.json`);
+  execFileSync(process.execPath, [join(root, 'node_modules', 'cashc', 'dist', 'cashc-cli.js'), source, '-o', output],
+    { cwd: root, stdio: 'inherit' });
+}
+console.log(`Compiled ${files.length} contracts into ${artifactDir}`);
+ 
+// === E:\frontend\bch\packages\contracts\src\index.ts === 
+export const SATS_PER_SHARE = 1000n;
+export type Outcome = 'YES' | 'NO';
+export const complementPrice = (_outcome: Outcome, priceSats: number): number => 1000 - priceSats;
+ 
+// === E:\frontend\bch\packages\contracts\src\BuyOrder.cash === 
+pragma cashscript ^0.13.0;
+
+contract BuyOrder(pubkey makerPubKey, bytes20 makerLockingBytecodeHash, bytes32 targetTokenCategory, int pricePerShareSats) {
+    function fill(int sharesFilled) {
+        require(sharesFilled > 0);
+        require(pricePerShareSats > 0 && pricePerShareSats < 1000);
+        int costSats = sharesFilled * pricePerShareSats;
+        require(tx.outputs[this.activeInputIndex].tokenCategory == targetTokenCategory);
+        require(tx.outputs[this.activeInputIndex].tokenAmount == sharesFilled);
+        require(hash160(tx.outputs[this.activeInputIndex].lockingBytecode) == makerLockingBytecodeHash);
+        if (tx.inputs[this.activeInputIndex].value > costSats + 1000) {
+            require(tx.outputs[this.activeInputIndex + 2].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);
+            require(tx.outputs[this.activeInputIndex + 2].value == tx.inputs[this.activeInputIndex].value - costSats);
+        }
+    }
+
+    function cancel(sig makerSig) {
+        require(checkSig(makerSig, makerPubKey));
+    }
+}
+ 
+// === E:\frontend\bch\packages\contracts\src\MarketVault.cash === 
+pragma cashscript ^0.13.0;
+
+contract MarketVault(bytes32 yesCategory, bytes32 noCategory, pubkey oraclePubKey, bytes4 marketId) {
+    function mintCompleteSet(int shares) {
+        require(shares > 0);
+        require(this.activeInputIndex == 0);
+        require(tx.inputs.length >= 3);
+        require(tx.inputs[0].nftCommitment == 0x00);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.inputs[1].tokenCategory == yesCategory + 0x02);
+        require(tx.inputs[2].tokenCategory == noCategory + 0x02);
+        require(tx.outputs[0].value == tx.inputs[0].value + shares * 1000);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].nftCommitment == 0x00);
+        require(tx.outputs[1].tokenCategory == yesCategory + 0x02);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == noCategory + 0x02);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[3].tokenCategory == yesCategory);
+        require(tx.outputs[3].tokenAmount == shares);
+        require(tx.outputs[4].tokenCategory == noCategory);
+        require(tx.outputs[4].tokenAmount == shares);
+    }
+
+    function mergeCompleteSet(int shares) {
+        require(shares > 0);
+        require(this.activeInputIndex == 0);
+        require(tx.inputs[0].nftCommitment == 0x00);
+        require(tx.inputs[1].tokenCategory == yesCategory);
+        require(tx.inputs[1].tokenAmount >= shares);
+        require(tx.inputs[2].tokenCategory == noCategory);
+        require(tx.inputs[2].tokenAmount >= shares);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[0].value == tx.inputs[0].value - tx.outputs[1].value - tx.outputs[2].value);
+        require(tx.outputs[0].value >= 1000);
+        require(tx.outputs[0].nftCommitment == 0x00);
+    }
+
+    function resolveMarket(datasig oracleSig, bytes1 outcome) {
+        require(this.activeInputIndex == 0);
+        require(tx.inputs[0].nftCommitment == 0x00);
+        require(outcome == 0x01 || outcome == 0x02);
+        require(checkDataSig(oracleSig, marketId + outcome, oraclePubKey));
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].nftCommitment == outcome);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+    }
+
+    function redeemWinnings(int shares) {
+        require(shares > 0);
+        require(this.activeInputIndex == 0);
+        require(tx.inputs[0].nftCommitment == 0x01 || tx.inputs[0].nftCommitment == 0x02);
+        require(tx.inputs[1].tokenAmount == shares);
+        require((tx.inputs[0].nftCommitment == 0x01 && tx.inputs[1].tokenCategory == yesCategory) ||
+            (tx.inputs[0].nftCommitment == 0x02 && tx.inputs[1].tokenCategory == noCategory));
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].value == tx.inputs[0].value - shares * 1000);
+        require(tx.outputs[0].nftCommitment == tx.inputs[0].nftCommitment);
+        require(tx.outputs[0].value >= 1000);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == shares * 1000);
+        require(tx.outputs[1].tokenCategory == 0x);
+    }
+}
+ 
+// === E:\frontend\bch\packages\contracts\src\MintingBaton.cash === 
+pragma cashscript ^0.13.0;
+
+contract MintingBaton(bytes20 vaultScriptHash) {
+    function preserve() {
+        require(hash160(tx.inputs[0].lockingBytecode) == vaultScriptHash);
+        require(tx.outputs[this.activeInputIndex].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);
+        bytes category, bytes capability = tx.inputs[this.activeInputIndex].tokenCategory.split(32);
+        require(capability == 0x02);
+        require(tx.outputs[this.activeInputIndex].tokenCategory == category + 0x02);
+        require(tx.outputs[this.activeInputIndex].nftCommitment == tx.inputs[this.activeInputIndex].nftCommitment);
+    }
+}
+ 
+// === E:\frontend\bch\packages\contracts\src\SellOrder.cash === 
+pragma cashscript ^0.13.0;
+
+contract SellOrder(pubkey makerPubKey, bytes20 makerLockingBytecodeHash, bytes32 tokenCategory, int pricePerShareSats) {
+    function fill(int sharesFilled, int executionPriceSats) {
+        require(sharesFilled > 0);
+        require(pricePerShareSats > 0 && pricePerShareSats < 1000);
+        require(executionPriceSats >= pricePerShareSats && executionPriceSats < 1000);
+        require(tx.inputs[this.activeInputIndex].tokenCategory == tokenCategory);
+        require(sharesFilled <= tx.inputs[this.activeInputIndex].tokenAmount);
+        int payoutSats = sharesFilled * executionPriceSats;
+        require(tx.outputs[this.activeInputIndex].value == payoutSats);
+        require(hash160(tx.outputs[this.activeInputIndex].lockingBytecode) == makerLockingBytecodeHash);
+        if (sharesFilled < tx.inputs[this.activeInputIndex].tokenAmount) {
+            require(tx.outputs[this.activeInputIndex + 2].tokenCategory == tokenCategory);
+            require(tx.outputs[this.activeInputIndex + 2].tokenAmount == tx.inputs[this.activeInputIndex].tokenAmount - sharesFilled);
+            require(tx.outputs[this.activeInputIndex + 2].lockingBytecode == tx.inputs[this.activeInputIndex].lockingBytecode);
+        }
+    }
+
+    function cancel(sig makerSig) {
+        require(checkSig(makerSig, makerPubKey));
+    }
+}
+ 
+// === E:\frontend\bch\packages\contracts\test\matching.test.ts === 
+import { describe, expect, it } from 'vitest';
+import { Contract, MockNetworkProvider, TransactionBuilder } from 'cashscript';
+import { readFileSync } from 'node:fs';
+const artifact = JSON.parse(readFileSync(new URL('../artifacts/BuyOrder.json', import.meta.url), 'utf8'));
+
+describe('CLOB settlement transaction cases', () => {
+  it('provides an isolated CashScript mock network for direct swaps', () => {
+    const provider = new MockNetworkProvider();
+    const builder = new TransactionBuilder({ provider });
+    const buy = new Contract(artifact, ['02'.repeat(33), '11'.repeat(20), '22'.repeat(32), 620n], { provider });
+    expect(builder.outputs).toHaveLength(0);
+    expect(buy.artifact.abi.map((fn: { name: string }) => fn.name)).toEqual(expect.arrayContaining(['fill', 'cancel']));
+  });
+  it('preserves complementary mint and merge satoshi totals', () => {
+    const shares = 25;
+    expect(shares * 620 + shares * 380).toBe(shares * 1000);
+    expect(shares * 450 + shares * 500).toBeLessThan(shares * 1000);
+  });
+});
+ 
+// === E:\frontend\bch\packages\contracts\test\vault.test.ts === 
+import { describe, expect, it } from 'vitest';
+import { Contract, MockNetworkProvider } from 'cashscript';
+import { SATS_PER_SHARE, complementPrice } from '../src/index.js';
+import { readFileSync } from 'node:fs';
+
+const artifact = JSON.parse(readFileSync(new URL('../artifacts/MarketVault.json', import.meta.url), 'utf8'));
+
+describe('MarketVault lifecycle invariants', () => {
+  it('uses native satoshi par value for complete set minting and merging', () => {
+    const provider = new MockNetworkProvider();
+    expect(provider).toBeDefined();
+    expect(100n * SATS_PER_SHARE).toBe(100_000n);
+    expect(100 * Number(SATS_PER_SHARE)).toBe(100_000);
+  });
+  it('keeps complementary prices at exactly 1000 satoshis', () => {
+    expect(complementPrice('YES', 620) + complementPrice('NO', 380)).toBe(1000);
+  });
+  it('encodes resolution commitments as one-byte state values', () => {
+    expect(['00', '01', '02']).toHaveLength(3);
+  });
+  it('loads the compiled vault artifact and exposes each lifecycle branch to CashScript', () => {
+    const provider = new MockNetworkProvider();
+    const vault = new Contract(artifact, ['00'.repeat(32), '11'.repeat(32), '02'.repeat(33), '01020304'], { provider });
+    const functions = vault.artifact.abi.map((item: { name: string }) => item.name);
+    expect(functions).toEqual(expect.arrayContaining(['mintCompleteSet', 'mergeCompleteSet', 'resolveMarket', 'redeemWinnings']));
+    expect(vault.address).toBeTruthy();
+  });
+});

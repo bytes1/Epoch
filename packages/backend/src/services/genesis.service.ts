@@ -3,6 +3,9 @@ import { eq } from 'drizzle-orm';
 import type { MarketDb } from '../db/index.js';
 import { markets, vaultUtxos } from '../db/schema.js';
 
+/** Fixed reserve, kept within JavaScript's exact integer range for DB accounting. */
+export const INITIAL_OUTCOME_TOKEN_SUPPLY = BigInt(Number.MAX_SAFE_INTEGER);
+
 export type GenesisResult = {
   marketIdHex: string; yesCategoryId: string; noCategoryId: string; vaultCategoryId: string;
   vaultContractAddress: string; txid: string;
@@ -35,7 +38,8 @@ export class GenesisService {
     ];
     for (const [vout, item] of roles.entries()) this.db.insert(vaultUtxos).values({
       id: randomUUID(), marketId: id, utxoRole: item.role, txid: result.txid, vout, satoshis: item.satoshis,
-      tokenCategory: item.category, tokenAmount: 0, nftCapability: item.role === 'VAULT_MASTER' ? 'mutable' : 'minting',
+      tokenCategory: item.category, tokenAmount: item.role === 'VAULT_MASTER' ? 0 : Number(INITIAL_OUTCOME_TOKEN_SUPPLY),
+      nftCapability: item.role === 'VAULT_MASTER' ? 'mutable' : 'minting',
       nftCommitment: item.commitment, updatedAt: now,
     }).run();
     return this.db.select().from(markets).where(eq(markets.id, id)).get()!;

@@ -2,14 +2,18 @@ import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Contract, ElectrumNetworkProvider, SignatureTemplate, TransactionBuilder, type Utxo } from 'cashscript';
 import { binToValueSatoshis, decodePrivateKeyWif, privateKeyToP2pkhCashAddress, secp256k1 } from '@bitauth/libauth';
-import type { GenesisAdapter, GenesisResult } from './genesis.service.js';
+import { INITIAL_OUTCOME_TOKEN_SUPPLY, type GenesisAdapter, type GenesisResult } from './genesis.service.js';
+import { walletMutex } from './utxo-queue.service.js';
+import { categoryIdVmBytes } from '../utils/cashtokens.js';
 
 const readArtifact = (name: string) => JSON.parse(readFileSync(new URL('../../../contracts/artifacts/' + name + '.json', import.meta.url), 'utf8'));
 
-export function decodeChipnetWallet(wif = process.env.MARKET_WALLET_PRIVATE_KEY) {
-  if (!wif) throw new Error('Set MARKET_WALLET_PRIVATE_KEY to a Chipnet WIF. Keep it private and out of source control.');
+export function decodeChipnetWallet(wallet: 1 | 2 = 1) {
+  const variable = wallet === 2 ? 'MARKET_WALLET_PRIVATE_KEY_2' : 'MARKET_WALLET_PRIVATE_KEY';
+  const wif = process.env[variable];
+  if (!wif) throw new Error(`Set ${variable} to a Chipnet WIF. Keep it private and out of source control.`);
   const decoded = decodePrivateKeyWif(wif);
-  if (typeof decoded === 'string') throw new Error('Invalid MARKET_WALLET_PRIVATE_KEY: ' + decoded);
+  if (typeof decoded === 'string') throw new Error(`Invalid ${variable}: ${decoded}`);
   return decoded.privateKey;
 }
 
@@ -28,6 +32,10 @@ export class ChipnetGenesisAdapter implements GenesisAdapter {
   private readonly walletAddress = chipnetFundingAddress(this.privateKey);
 
   async createMarket(_title: string, _description: string): Promise<GenesisResult> {
+    return walletMutex.runExclusive('chipnet-operational-wallet', () => this.createMarketExclusive());
+  }
+
+  private async createMarketExclusive(): Promise<GenesisResult> {
     const walletUtxos = (await this.provider.getUtxos(this.walletAddress))
       .filter((utxo) => !utxo.token).sort((a, b) => Number(b.satoshis - a.satoshis));
     const initialFunding: Utxo[] = [];
@@ -67,7 +75,7 @@ export class ChipnetGenesisAdapter implements GenesisAdapter {
     const noCategoryId = preGenesis[1]!.txid;
     const vaultCategoryId = preGenesis[2]!.txid;
 
-    const vault = new Contract(readArtifact('MarketVault'), [yesCategoryId, noCategoryId, oraclePubKey, marketIdHex], { provider: this.provider });
+    const vault = new Contract(readArtifact('MarketVault'), [categoryIdVmBytes(yesCategoryId), categoryIdVmBytes(noCategoryId), oraclePubKey, marketIdHex], { provider: this.provider });
     const vaultScriptHash = hash160(vault.lockingBytecode);
     const yesBaton = new Contract(readArtifact('MintingBaton'), [vaultScriptHash], { provider: this.provider });
     const noBaton = new Contract(readArtifact('MintingBaton'), [vaultScriptHash], { provider: this.provider });
@@ -76,8 +84,8 @@ export class ChipnetGenesisAdapter implements GenesisAdapter {
     genesis.addInput(spendable[0]!, this.signer.unlockP2PKH());
     genesis.addOutputs([
       { to: vault.tokenAddress, amount: 1000n, token: { category: vaultCategoryId, amount: 0n, nft: { capability: 'mutable', commitment: '00' } } },
-      { to: yesBaton.tokenAddress, amount: 1000n, token: { category: yesCategoryId, amount: 0n, nft: { capability: 'minting', commitment: '' } } },
-      { to: noBaton.tokenAddress, amount: 1000n, token: { category: noCategoryId, amount: 0n, nft: { capability: 'minting', commitment: '' } } },
+      { to: yesBaton.tokenAddress, amount: 1000n, token: { category: yesCategoryId, amount: INITIAL_OUTCOME_TOKEN_SUPPLY, nft: { capability: 'minting', commitment: '' } } },
+      { to: noBaton.tokenAddress, amount: 1000n, token: { category: noCategoryId, amount: INITIAL_OUTCOME_TOKEN_SUPPLY, nft: { capability: 'minting', commitment: '' } } },
     ]);
     genesis.addBchChangeOutputIfNeeded({ to: this.walletAddress, feeRate: 1 });
     const sent = await genesis.send();
